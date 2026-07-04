@@ -11,11 +11,15 @@ from os.path import splitext, isfile, join
 from pathlib import Path
 from torch.utils.data import Dataset
 from tqdm import tqdm
+import tifffile
+import cv2
 
 
 def load_image(filename):
     ext = splitext(filename)[1]
-    if ext == '.npy':
+    if ext in ['.tif', '.tiff']:
+        return tifffile.imread(filename)          # numpy array, native dtype preserved
+    elif ext == '.npy':
         return Image.fromarray(np.load(filename))
     elif ext in ['.pt', '.pth']:
         return Image.fromarray(torch.load(filename).numpy())
@@ -62,32 +66,25 @@ class BasicDataset(Dataset):
         return len(self.ids)
 
     @staticmethod
-    def preprocess(mask_values, pil_img, scale, is_mask):
-        w, h = pil_img.size
+    def preprocess(mask_values, img, scale, is_mask):
+        w, h = img.shape[:2]
         newW, newH = int(scale * w), int(scale * h)
         assert newW > 0 and newH > 0, 'Scale is too small, resized images would have no pixel'
-        pil_img = pil_img.resize((newW, newH), resample=Image.NEAREST if is_mask else Image.BICUBIC)
-        img = np.asarray(pil_img)
+        interp = cv2.INTER_NEAREST if is_mask else cv2.INTER_CUBIC
+        img = cv2.resize(img, (newW, newH), interpolation=interp)
 
         if is_mask:
             mask = np.zeros((newH, newW), dtype=np.int64)
             for i, v in enumerate(mask_values):
-                if img.ndim == 2:
-                    mask[img == v] = i
-                else:
-                    mask[(img == v).all(-1)] = i
-
+                mask[img == v] = i
             return mask
-
         else:
-            if img.ndim == 2:
-                img = img[np.newaxis, ...]
-            else:
-                img = img.transpose((2, 0, 1))
-
-            if (img > 1).any():
-                img = img / 255.0
-
+            img = img.astype(np.float32)
+            # per-slice robust min-max normalization (handles arbitrary 32-bit intensity range)
+            lo, hi = np.percentile(img, [0.5, 99.5])
+            img = np.clip(img, lo, hi)
+            img = (img - lo) / (hi - lo + 1e-8)
+            img = img[np.newaxis, ...]          # (H, W) -> (1, H, W), single-channel MRI
             return img
 
     def __getitem__(self, idx):
@@ -100,8 +97,8 @@ class BasicDataset(Dataset):
         mask = load_image(mask_file[0])
         img = load_image(img_file[0])
 
-        assert img.size == mask.size, \
-            f'Image and mask {name} should be the same size, but are {img.size} and {mask.size}'
+        assert img.shape[:2] == mask.shape[:2], \
+            f'Image and mask {name} should be the same size, but are {img.shape} and {mask.shape}'
 
         img = self.preprocess(self.mask_values, img, self.scale, is_mask=False)
         mask = self.preprocess(self.mask_values, mask, self.scale, is_mask=True)
@@ -112,6 +109,13 @@ class BasicDataset(Dataset):
         }
 
 
-class CarvanaDataset(BasicDataset):
+# class CarvanaDataset(BasicDataset):
+#     def __init__(self, images_dir, mask_dir, scale=1):
+#         super().__init__(images_dir, mask_dir, scale, mask_suffix='_mask')
+
+
+
+# FIX THIS, REFER TO COMMENT (MAY NEED TO SCROLL RIGHT)
+class MRIDataset(BasicDataset):
     def __init__(self, images_dir, mask_dir, scale=1):
-        super().__init__(images_dir, mask_dir, scale, mask_suffix='_mask')
+        super().__init__(images_dir, mask_dir, scale, mask_suffix='')  # match your actual suffix

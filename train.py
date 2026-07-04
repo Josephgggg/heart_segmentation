@@ -16,8 +16,12 @@ from tqdm import tqdm
 import wandb
 from evaluate import evaluate
 from unet import UNet
-from utils.data_loading import BasicDataset, CarvanaDataset
+from utils.data_loading import BasicDataset, CarvanaDataset, MRIDataset
 from utils.dice_score import dice_loss
+
+import re
+from collections import defaultdict
+from torch.utils.data import Subset
 
 dir_img = Path('./data/imgs/')
 dir_mask = Path('./data/masks/')
@@ -39,15 +43,31 @@ def train_model(
         gradient_clipping: float = 1.0,
 ):
     # 1. Create dataset
-    try:
-        dataset = CarvanaDataset(dir_img, dir_mask, img_scale)
-    except (AssertionError, RuntimeError, IndexError):
-        dataset = BasicDataset(dir_img, dir_mask, img_scale)
+    dataset = MRIDataset(dir_img, dir_mask, img_scale)
+
+    # try:
+    #     dataset = CarvanaDataset(dir_img, dir_mask, img_scale)
+    # except (AssertionError, RuntimeError, IndexError):
+    #     dataset = BasicDataset(dir_img, dir_mask, img_scale)
 
     # 2. Split into train / validation partitions
-    n_val = int(len(dataset) * val_percent)
-    n_train = len(dataset) - n_val
-    train_set, val_set = random_split(dataset, [n_train, n_val], generator=torch.Generator().manual_seed(0))
+    patient_ids = defaultdict(list)
+    for i, id_ in enumerate(dataset.ids):
+        match = re.match(r'^(CADRE_\d{4})\d+$', id_)
+        assert match, f'Unexpected filename pattern: {id_}'
+        patient = match.group(1)
+        patient_ids[patient].append(i)
+
+    patients = list(patient_ids.keys())
+    random.Random(0).shuffle(patients)
+    n_val_patients = max(1, int(len(patients) * val_percent))
+    val_patients = set(patients[:n_val_patients])
+
+    val_idx = [i for p in val_patients for i in patient_ids[p]]
+    train_idx = [i for p in patients if p not in val_patients for i in patient_ids[p]]
+
+    train_set, val_set = Subset(dataset, train_idx), Subset(dataset, val_idx)
+    n_train, n_val = len(train_set), len(val_set)
 
     # 3. Create data loaders
     loader_args = dict(batch_size=batch_size, num_workers=os.cpu_count(), pin_memory=True)
@@ -194,7 +214,7 @@ if __name__ == '__main__':
     # Change here to adapt to your data
     # n_channels=3 for RGB images
     # n_classes is the number of probabilities you want to get per pixel
-    model = UNet(n_channels=3, n_classes=args.classes, bilinear=args.bilinear)
+    model = UNet(n_channels=1, n_classes=args.classes, bilinear=args.bilinear)
     model = model.to(memory_format=torch.channels_last)
 
     logging.info(f'Network:\n'

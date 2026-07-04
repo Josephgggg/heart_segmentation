@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms
 
-from utils.data_loading import BasicDataset
+from utils.data_loading import BasicDataset, load_image
 from unet import UNet
 from utils.utils import plot_img_and_mask
 
@@ -24,7 +24,7 @@ def predict_img(net,
 
     with torch.no_grad():
         output = net(img).cpu()
-        output = F.interpolate(output, (full_img.size[1], full_img.size[0]), mode='bilinear')
+        output = F.interpolate(output, full_img.shape[:2], mode='bilinear')
         if net.n_classes > 1:
             mask = output.argmax(dim=1)
         else:
@@ -83,7 +83,7 @@ if __name__ == '__main__':
     in_files = args.input
     out_files = get_output_filenames(args)
 
-    net = UNet(n_channels=3, n_classes=args.classes, bilinear=args.bilinear)
+    net = UNet(n_channels=1, n_classes=args.classes, bilinear=args.bilinear)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logging.info(f'Loading model {args.model}')
@@ -98,7 +98,7 @@ if __name__ == '__main__':
 
     for i, filename in enumerate(in_files):
         logging.info(f'Predicting image {filename} ...')
-        img = Image.open(filename)
+        img = load_image(filename)
 
         mask = predict_img(net=net,
                            full_img=img,
