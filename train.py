@@ -16,7 +16,7 @@ from tqdm import tqdm
 import wandb
 from evaluate import evaluate
 from unet import UNet
-from utils.data_loading import BasicDataset, MRIDataset
+from utils.data_loading import BasicDataset, VolumeMRIDataset
 from utils.dice_score import dice_loss
 
 import re
@@ -43,7 +43,8 @@ def train_model(
         gradient_clipping: float = 1.0,
 ):
     # 1. Create dataset
-    dataset = MRIDataset(dir_img, dir_mask, img_scale)
+    #dataset = MRIDataset(dir_img, dir_mask, img_scale)
+    dataset = VolumeMRIDataset(dir_img, dir_mask, scale=img_scale)
 
     # try:
     #     dataset = CarvanaDataset(dir_img, dir_mask, img_scale)
@@ -51,26 +52,19 @@ def train_model(
     #     dataset = BasicDataset(dir_img, dir_mask, img_scale)
 
     # 2. Split into train / validation partitions
-    patient_ids = defaultdict(list)
-    for i, id_ in enumerate(dataset.ids):
-        match = re.match(r'^(CADRE_\d{4})\d+$', id_)
-        assert match, f'Unexpected filename pattern: {id_}'
-        patient = match.group(1)
-        patient_ids[patient].append(i)
-
-    patients = list(patient_ids.keys())
+    patients = list(dataset.mask_file_for.keys())
     random.Random(0).shuffle(patients)
     n_val_patients = max(1, int(len(patients) * val_percent))
     val_patients = set(patients[:n_val_patients])
 
-    val_idx = [i for p in val_patients for i in patient_ids[p]]
-    train_idx = [i for p in patients if p not in val_patients for i in patient_ids[p]]
+    train_idx = [i for i, (p, _) in enumerate(dataset.index) if p not in val_patients]
+    val_idx = [i for i, (p, _) in enumerate(dataset.index) if p in val_patients]
 
     train_set, val_set = Subset(dataset, train_idx), Subset(dataset, val_idx)
     n_train, n_val = len(train_set), len(val_set)
 
     # 3. Create data loaders
-    loader_args = dict(batch_size=batch_size, num_workers=os.cpu_count(), pin_memory=True)
+    loader_args = dict(batch_size=batch_size, num_workers=0, pin_memory=True)
     train_loader = DataLoader(train_set, shuffle=True, **loader_args)
     val_loader = DataLoader(val_set, shuffle=False, drop_last=True, **loader_args)
 
@@ -108,12 +102,13 @@ def train_model(
         with tqdm(total=n_train, desc=f'Epoch {epoch}/{epochs}', unit='img') as pbar:
             for batch in train_loader:
                 images, true_masks = batch['image'], batch['mask']
+                print('images shape:', images.shape, 'true_masks shape:', true_masks.shape)   # add this lin
 
                 assert images.shape[1] == model.n_channels, \
                     f'Network has been defined with {model.n_channels} input channels, ' \
                     f'but loaded images have {images.shape[1]} channels. Please check that ' \
                     'the images are loaded correctly.'
-
+                
                 images = images.to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
                 true_masks = true_masks.to(device=device, dtype=torch.long)
 
