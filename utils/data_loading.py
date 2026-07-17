@@ -18,15 +18,23 @@ from pydicom.pixel_data_handlers.util import apply_modality_lut
 import nibabel as nib
 
 def load_image(filename):
-    ext = splitext(filename)[1]
-    if ext in ['.tif', '.tiff']:
-        return tifffile.imread(filename)          # numpy array, native dtype preserved
+    ext = splitext(filename)[1].lower()
+    if ext == '.dcm':
+        ds = pydicom.dcmread(filename)
+        img = apply_modality_lut(ds.pixel_array, ds).astype(np.float32)
+        if img.ndim == 4:
+            img = img[..., 0]
+        if getattr(ds, 'PhotometricInterpretation', '') == 'MONOCHROME1':
+            img = img.max() - img
+        return img
+    elif ext in ['.tif', '.tiff']:
+        return tifffile.imread(filename)
     elif ext == '.npy':
-        return Image.fromarray(np.load(filename))
+        return np.load(filename)
     elif ext in ['.pt', '.pth']:
-        return Image.fromarray(torch.load(filename).numpy())
+        return torch.load(filename).numpy()
     else:
-        return Image.open(filename)
+        return np.asarray(Image.open(filename))
 
 
 def unique_mask_values(idx, mask_dir, mask_suffix):
