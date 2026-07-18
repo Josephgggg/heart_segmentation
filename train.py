@@ -44,12 +44,12 @@ def train_model(
 ):
     # 1. Create dataset
     #dataset = MRIDataset(dir_img, dir_mask, img_scale)
-    dataset = VolumeMRIDataset(dir_img, dir_mask, scale=img_scale)
+    #dataset = VolumeMRIDataset(dir_img, dir_mask, scale=img_scale)
 
-    # try:
-    #     dataset = CarvanaDataset(dir_img, dir_mask, img_scale)
-    # except (AssertionError, RuntimeError, IndexError):
-    #     dataset = BasicDataset(dir_img, dir_mask, img_scale)
+    try:
+        dataset = VolumeMRIDataset(dir_img, dir_mask, img_scale)
+    except (AssertionError, RuntimeError, IndexError):
+        dataset = BasicDataset(dir_img, dir_mask, img_scale)
 
     # 2. Split into train / validation partitions
     patients = list(dataset.mask_file_for.keys())
@@ -64,12 +64,16 @@ def train_model(
     n_train, n_val = len(train_set), len(val_set)
 
     # 3. Create data loaders
-    loader_args = dict(batch_size=batch_size, num_workers=os.cpu_count(), pin_memory=True)
+    loader_args = dict(batch_size=batch_size, num_workers=4, pin_memory=True)
     train_loader = DataLoader(train_set, shuffle=True, **loader_args)
     val_loader = DataLoader(val_set, shuffle=False, drop_last=False, **loader_args)
 
     # (Initialize logging)
-    experiment = wandb.init(project='U-Net', resume='allow', anonymous='must')
+    experiment = wandb.init(
+    project='cardiac-mri-segmentation',
+    name='unet-baseline',
+    resume='allow'
+)
     experiment.config.update(
         dict(epochs=epochs, batch_size=batch_size, learning_rate=learning_rate,
              val_percent=val_percent, save_checkpoint=save_checkpoint, img_scale=img_scale, amp=amp)
