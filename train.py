@@ -22,11 +22,35 @@ from utils.dice_score import dice_loss
 import re
 from collections import defaultdict
 from torch.utils.data import Subset
+from torch.utils.data import Sampler
+import datetime
 
 dir_img = Path('./data/imgs/')
 dir_mask = Path('./data/masks/')
 dir_checkpoint = Path('./checkpoints/')
 
+
+class PatientGroupedSampler(Sampler):
+    def __init__(self, index_subset):
+        self.index_subset = index_subset
+
+    def __iter__(self):
+        by_patient = defaultdict(list)
+        for local_i, (patient_id, _) in enumerate(self.index_subset):
+            by_patient[patient_id].append(local_i)
+
+        patients = list(by_patient.keys())
+        random.shuffle(patients)
+
+        order = []
+        for p in patients:
+            idxs = by_patient[p]
+            random.shuffle(idxs)
+            order.extend(idxs)
+        return iter(order)
+
+    def __len__(self):
+        return len(self.index_subset)
 
 def train_model(
         model,
@@ -41,6 +65,7 @@ def train_model(
         weight_decay: float = 1e-8,
         momentum: float = 0.999,
         gradient_clipping: float = 1.0,
+        run_name=None,
 ):
     # 1. Create dataset
     #dataset = MRIDataset(dir_img, dir_mask, img_scale)
@@ -64,9 +89,15 @@ def train_model(
     n_train, n_val = len(train_set), len(val_set)
 
     # 3. Create data loaders
-    loader_args = dict(batch_size=batch_size, num_workers=4, pin_memory=True)
-    train_loader = DataLoader(train_set, shuffle=True, **loader_args)
-    val_loader = DataLoader(val_set, shuffle=False, drop_last=False, **loader_args)
+    train_index_subset = [dataset.index[i] for i in train_idx]
+    val_index_subset = [dataset.index[i] for i in val_idx]
+
+    train_sampler = PatientGroupedSampler(train_index_subset)
+    val_sampler = PatientGroupedSampler(val_index_subset)
+
+    loader_args = dict(batch_size=batch_size, num_workers=0, pin_memory=True)
+    train_loader = DataLoader(train_set, sampler=train_sampler, **loader_args)
+    val_loader = DataLoader(val_set, sampler=val_sampler, drop_last=False, **loader_args)
 
     # (Initialize logging)
     experiment = wandb.init(
@@ -117,16 +148,18 @@ def train_model(
 
                 with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
                     masks_pred = model(images)
-                    if model.n_classes == 1:
-                        loss = criterion(masks_pred.squeeze(1), true_masks.float())
-                        loss += dice_loss(F.sigmoid(masks_pred.squeeze(1)), true_masks.float(), multiclass=False)
-                    else:
-                        loss = criterion(masks_pred, true_masks)
-                        loss += dice_loss(
-                            F.softmax(masks_pred, dim=1).float(),
-                            F.one_hot(true_masks, model.n_classes).permute(0, 3, 1, 2).float(),
-                            multiclass=True
-                        )
+
+                # loss computed OUTSIDE autocast — always float32
+                if model.n_classes == 1:
+                    loss = criterion(masks_pred.squeeze(1).float(), true_masks.float())
+                    loss += dice_loss(F.sigmoid(masks_pred.squeeze(1).float()), true_masks.float(), multiclass=False)
+                else:
+                    loss = criterion(masks_pred.float(), true_masks)
+                    loss += dice_loss(
+                        F.softmax(masks_pred.float(), dim=1),
+                        F.one_hot(true_masks, model.n_classes).permute(0, 3, 1, 2).float(),
+                        multiclass=True
+                    )
 
                 optimizer.zero_grad(set_to_none=True)
                 grad_scaler.scale(loss).backward()
@@ -176,6 +209,10 @@ def train_model(
                             })
                         except:
                             pass
+
+        if run_name is None:
+            run_name = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        run_checkpoint_dir = Path(dir_checkpoint) / run_name
 
         if save_checkpoint:
             Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)

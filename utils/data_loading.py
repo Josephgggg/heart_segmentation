@@ -16,6 +16,7 @@ import cv2
 import pydicom
 from pydicom.pixel_data_handlers.util import apply_modality_lut
 import nibabel as nib
+from collections import OrderedDict
 
 def load_image(filename):
     ext = splitext(filename)[1].lower()
@@ -124,10 +125,17 @@ class BasicDataset(Dataset):
 #         super().__init__(images_dir, mask_dir, scale, mask_suffix='_mask')
 
 class VolumeMRIDataset(Dataset):
-    def __init__(self, images_dir, mask_dir, scale: float = 1.0):
+    def __init__(self, images_dir, mask_dir, scale: float = 1.0, cache_size: int = 1000, disk_cache_dir=None):
         self.images_dir = Path(images_dir)
         self.mask_dir = Path(mask_dir)
         self.scale = scale
+        self.cache_size = cache_size
+        
+        # processed volumes get saved/loaded on disk
+        self.disk_cache_dir = Path(disk_cache_dir) if disk_cache_dir else self.images_dir.parent / 'preprocessed_cache'
+        self.disk_cache_dir.mkdir(parents=True, exist_ok=True)
+
+        self._volume_cache = OrderedDict() # patient_id -> (img_vol, mask_vol)
 
         self.patient_files = sorted(self.images_dir.glob('*.dcm'))
         assert self.patient_files, f'No .dcm files found in {images_dir}'
@@ -142,57 +150,87 @@ class VolumeMRIDataset(Dataset):
             assert len(mask_matches) == 1, f'Expected 1 mask for {patient_id}, found {mask_matches}'
             self.mask_file_for[patient_id] = mask_matches[0]
 
-            ds = pydicom.dcmread(img_path)
-            n_total = ds.pixel_array.shape[0] if ds.pixel_array.ndim in (3, 4) else 1
-            n = n_total // 2   # water phase only
+            # NEW: if a disk cache already exists, read the slice count from THAT (fast),
+            # instead of opening the raw .dcm just to check its frame count
+            img_cache_path, mask_cache_path = self._disk_cache_paths(patient_id)
+            if img_cache_path.exists():
+                n = np.load(img_cache_path, mmap_mode='r').shape[0]
+            else:
+                ds = pydicom.dcmread(img_path)
+                n_total = ds.pixel_array.shape[0] if ds.pixel_array.ndim in (3, 4) else 1
+                n = n_total // 2
+
             self.index.extend((patient_id, s) for s in range(n))
 
         logging.info(f'Found {len(self.patient_files)} patients, {len(self.index)} total slices')
-        logging.info('Scanning mask files to determine unique values (loads every volume once)...')
-        all_values = set()
-        for patient_id, mask_path in self.mask_file_for.items():
-            vol = nib.load(mask_path).get_fdata()
-            all_values.update(np.unique(vol).tolist())
-        self.mask_values = sorted(all_values)
+        logging.info('Scanning mask files to determine unique values...')
+        #all_values = set()
+        #for patient_id in self.mask_file_for:
+        #    _, mask_vol = self._get_volume(patient_id)   # uses disk cache if available
+        #    all_values.update(np.unique(mask_vol).tolist())
+        #self.mask_values = sorted(all_values)
+        self.mask_values = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
         logging.info(f'Unique mask values: {self.mask_values}')
 
-        self._cache_patient = None
-        self._cache_img_vol = None
-        self._cache_mask_vol = None
+    def _disk_cache_paths(self, patient_id):
+        return (self.disk_cache_dir / f'{patient_id}_img.npy',
+                self.disk_cache_dir / f'{patient_id}_mask.npy')
 
     def __len__(self):
         return len(self.index)
 
-    def _load_volume(self, patient_id):
-        if self._cache_patient == patient_id:
-            return self._cache_img_vol, self._cache_mask_vol
+    def _read_and_process_volume(self, patient_id):
+        img_cache_path, mask_cache_path = self._disk_cache_paths(patient_id)
 
+        # NEW: fast path — already preprocessed, just load it
+        if img_cache_path.exists() and mask_cache_path.exists():
+            img_vol = np.load(img_cache_path)
+            mask_vol = np.load(mask_cache_path)
+            return img_vol, mask_vol
+
+        # slow path — first time seeing this patient, do the real work
         img_path = self.images_dir / f'{patient_id}.dcm'
         ds = pydicom.dcmread(img_path)
         img_vol = apply_modality_lut(ds.pixel_array, ds).astype(np.float32)
-        if img_vol.ndim == 4:   # (frames, H, W, 3) -> (frames, H, W)
-            img_vol = img_vol[..., 0]   # use .mean(axis=-1) instead if the channel check above showed differences
+        if img_vol.ndim == 4:
+            img_vol = img_vol[..., 0]
         if getattr(ds, 'PhotometricInterpretation', '') == 'MONOCHROME1':
             img_vol = img_vol.max() - img_vol
         if img_vol.ndim == 2:
             img_vol = img_vol[np.newaxis, ...]
 
         n_total = img_vol.shape[0]
-        img_vol = img_vol[:n_total // 2]   # keep only the water-phase half
+        img_vol = img_vol[:n_total // 2]
 
         mask_vol = nib.load(self.mask_file_for[patient_id]).get_fdata()
-        mask_vol = np.transpose(mask_vol, (2, 0, 1))   # (H, W, slices) -> (slices, H, W)
-        mask_vol = np.rot90(mask_vol[:, :, ::-1], k=1, axes=(1, 2))   # flip horizontal, then rotate 90° CCW
+        mask_vol = np.transpose(mask_vol, (2, 0, 1))
+        mask_vol = np.rot90(mask_vol[:, :, ::-1], k=1, axes=(1, 2)).astype(np.float32)
 
         assert img_vol.shape[0] == mask_vol.shape[0], \
             f'{patient_id}: {img_vol.shape[0]} image slices vs {mask_vol.shape[0]} mask slices — mismatch'
 
-        self._cache_patient, self._cache_img_vol, self._cache_mask_vol = patient_id, img_vol, mask_vol
+        # NEW: save the result to disk so future runs skip all of the above
+        logging.info(f'Preprocessing {patient_id} for the first time, saving to disk cache...')
+        np.save(img_cache_path, img_vol)
+        np.save(mask_cache_path, mask_vol)
+
+        return img_vol, mask_vol
+    
+    def _get_volume(self, patient_id):
+        if patient_id in self._volume_cache:
+            self._volume_cache.move_to_end(patient_id)
+            return self._volume_cache[patient_id]
+
+        img_vol, mask_vol = self._read_and_process_volume(patient_id)
+        self._volume_cache[patient_id] = (img_vol, mask_vol)
+        self._volume_cache.move_to_end(patient_id)
+        if len(self._volume_cache) > self.cache_size:
+            self._volume_cache.popitem(last=False)
         return img_vol, mask_vol
 
     def __getitem__(self, idx):
         patient_id, slice_idx = self.index[idx]
-        img_vol, mask_vol = self._load_volume(patient_id)
+        img_vol, mask_vol = self._get_volume(patient_id)   # uses the cache now
         img, mask = img_vol[slice_idx], mask_vol[slice_idx]
 
         img = BasicDataset.preprocess(self.mask_values, img, self.scale, is_mask=False)
@@ -200,7 +238,9 @@ class VolumeMRIDataset(Dataset):
 
         return {
             'image': torch.as_tensor(img.copy()).float().contiguous(),
-            'mask': torch.as_tensor(mask.copy()).long().contiguous()
+            'mask': torch.as_tensor(mask.copy()).long().contiguous(),
+            'patient_id': patient_id,
+            'slice_idx': slice_idx
         }
 
 
