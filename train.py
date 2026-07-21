@@ -129,6 +129,7 @@ def train_model(
     grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
     criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss()
     global_step = 0
+    batch_skip_count = 0
 
     # 5. Begin training
     for epoch in range(1, epochs + 1):
@@ -160,6 +161,12 @@ def train_model(
                         F.one_hot(true_masks, model.n_classes).permute(0, 3, 1, 2).float(),
                         multiclass=True
                     )
+
+                if not torch.isfinite(loss):
+                    batch_skip_count += 1
+                    logging.warning(f'Non-finite loss at step {global_step}, skipping batch.')
+                    print(f"Batch skip count: {batch_skip_count}")
+                    continue   # skips backward, optimizer step, and logging entirely for this batch
 
                 optimizer.zero_grad(set_to_none=True)
                 grad_scaler.scale(loss).backward()
