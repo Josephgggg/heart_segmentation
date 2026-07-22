@@ -17,6 +17,8 @@ import pydicom
 from pydicom.pixel_data_handlers.util import apply_modality_lut
 import nibabel as nib
 from collections import OrderedDict
+from scipy.ndimage import gaussian_filter, map_coordinates
+import random
 
 def load_image(filename):
     ext = splitext(filename)[1].lower()
@@ -243,6 +245,64 @@ class VolumeMRIDataset(Dataset):
             'slice_idx': slice_idx
         }
 
+
+class AugmentedDataset(Dataset):
+    """Wraps a dataset (typically a Subset of VolumeMRIDataset) and applies
+    random rotation + elastic deformation to each (image, mask) pair, identically.
+    Only wrap your TRAINING subset with this — never validation."""
+
+    def __init__(self, base_dataset, rotate_prob=0.5, rotate_range=20,
+                 elastic_prob=0.5, elastic_alpha=20, elastic_sigma=4):
+        self.base_dataset = base_dataset
+        self.rotate_prob = rotate_prob
+        self.rotate_range = rotate_range      # max degrees, either direction
+        self.elastic_prob = elastic_prob
+        self.elastic_alpha = elastic_alpha    # deformation strength
+        self.elastic_sigma = elastic_sigma    # smoothness of the deformation
+
+    def __len__(self):
+        return len(self.base_dataset)
+
+    def _rotate(self, img, mask):
+        angle = random.uniform(-self.rotate_range, self.rotate_range)
+        h, w = img.shape[-2:]
+        M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
+
+        img_rot = cv2.warpAffine(img[0], M, (w, h),
+                                  flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT)
+        mask_rot = cv2.warpAffine(mask.astype(np.float32), M, (w, h),
+                                   flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+        return img_rot[np.newaxis, ...].astype(np.float32), mask_rot
+
+    def _elastic_deform(self, img, mask):
+        h, w = img.shape[-2:]
+        dx = gaussian_filter(np.random.rand(h, w) * 2 - 1, self.elastic_sigma) * self.elastic_alpha
+        dy = gaussian_filter(np.random.rand(h, w) * 2 - 1, self.elastic_sigma) * self.elastic_alpha
+
+        x, y = np.meshgrid(np.arange(w), np.arange(h))
+        coords = np.array([(y + dy).ravel(), (x + dx).ravel()])   # (row, col) order for map_coordinates
+
+        img_def = map_coordinates(img[0], coords, order=3, mode='reflect').reshape(h, w)
+        mask_def = map_coordinates(mask.astype(np.float32), coords, order=0, mode='reflect').reshape(h, w)
+
+        return img_def[np.newaxis, ...].astype(np.float32), mask_def
+
+    def __getitem__(self, idx):
+        sample = self.base_dataset[idx]
+        img = sample['image'].numpy()   # (1, H, W) float32
+        mask = sample['mask'].numpy()   # (H, W) int64
+
+        if random.random() < self.rotate_prob:
+            img, mask = self._rotate(img, mask)
+
+        if random.random() < self.elastic_prob:
+            img, mask = self._elastic_deform(img, mask)
+
+        return {
+            'image': torch.as_tensor(img.copy()).float().contiguous(),
+            'mask': torch.as_tensor(mask.copy()).long().contiguous()
+        }
 
 
 # class MRIDataset(BasicDataset):

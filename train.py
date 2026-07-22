@@ -12,6 +12,7 @@ from pathlib import Path
 from torch import optim
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
+from utils.data_loading import AugmentedDataset
 
 import wandb
 from evaluate import evaluate
@@ -24,6 +25,7 @@ from collections import defaultdict
 from torch.utils.data import Subset
 from torch.utils.data import Sampler
 import datetime
+import time
 
 dir_img = Path('./data/imgs/')
 dir_mask = Path('./data/masks/')
@@ -95,7 +97,10 @@ def train_model(
     train_sampler = PatientGroupedSampler(train_index_subset)
     val_sampler = PatientGroupedSampler(val_index_subset)
 
-    loader_args = dict(batch_size=batch_size, num_workers=0, pin_memory=True)
+    # wrap training set with augmentation
+    train_set = AugmentedDataset(train_set)
+
+    loader_args = dict(batch_size=batch_size, num_workers=4, pin_memory=True, persistent_workers=True)
     train_loader = DataLoader(train_set, sampler=train_sampler, **loader_args)
     val_loader = DataLoader(val_set, sampler=val_sampler, drop_last=False, **loader_args)
 
@@ -137,7 +142,9 @@ def train_model(
         epoch_loss = 0
         with tqdm(total=n_train, desc=f'Epoch {epoch}/{epochs}', unit='img') as pbar:
             for batch in train_loader:
+                #print("yo")
                 images, true_masks = batch['image'], batch['mask']
+                #print("yoyo")
 
                 assert images.shape[1] == model.n_channels, \
                     f'Network has been defined with {model.n_channels} input channels, ' \
@@ -148,33 +155,68 @@ def train_model(
                 true_masks = true_masks.to(device=device, dtype=torch.long)
 
                 with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
+                    #print("hello")
                     masks_pred = model(images)
+                    #print("bye")
+                #masks_pred = torch.clamp(masks_pred.float(), min=-20, max=20)
 
-                # loss computed OUTSIDE autocast — always float32
-                if model.n_classes == 1:
-                    loss = criterion(masks_pred.squeeze(1).float(), true_masks.float())
-                    loss += dice_loss(F.sigmoid(masks_pred.squeeze(1).float()), true_masks.float(), multiclass=False)
-                else:
-                    loss = criterion(masks_pred.float(), true_masks)
-                    loss += dice_loss(
-                        F.softmax(masks_pred.float(), dim=1),
-                        F.one_hot(true_masks, model.n_classes).permute(0, 3, 1, 2).float(),
-                        multiclass=True
-                    )
+                    # loss computed OUTSIDE autocast — always float32
+                    if model.n_classes == 1:
+                        loss = criterion(masks_pred.squeeze(1).float(), true_masks.float())
+                        loss += dice_loss(F.sigmoid(masks_pred.squeeze(1).float()), true_masks.float(), multiclass=False)
+                    else:
+                        loss = criterion(masks_pred.float(), true_masks)
+                        loss += dice_loss(
+                            F.softmax(masks_pred.float(), dim=1),
+                            F.one_hot(true_masks, model.n_classes).permute(0, 3, 1, 2).float(),
+                            multiclass=True
+                        )
 
-                if not torch.isfinite(loss):
-                    batch_skip_count += 1
-                    logging.warning(f'Non-finite loss at step {global_step}, skipping batch.')
-                    print(f"Batch skip count: {batch_skip_count}")
-                    continue   # skips backward, optimizer step, and logging entirely for this batch
+                # if not torch.isfinite(loss):
+                #     batch_skip_count += 1
+                #     logging.warning(f'Non-finite loss at step {global_step}, skipping batch.')
+                #     print(f"Batch skip count: {batch_skip_count}")
 
+                    # print("images:",
+                    #     torch.isnan(images).any().item(),
+                    #     torch.isinf(images).any().item())
+
+                    # print("predictions:",
+                    #     torch.isnan(masks_pred).any().item(),
+                    #     torch.isinf(masks_pred).any().item())
+
+                    # print("min/max:",
+                    #     masks_pred.min().item(),
+                    #     masks_pred.max().item())
+                    
+                    # return {
+                    #     "images": images.detach().cpu(),
+                    #     "true_masks": true_masks.detach().cpu(),
+                    #     "pred_masks": masks_pred.detach().cpu(),
+                    #     "patient_ids": batch["patient_id"],
+                    #     "slice_idxs": batch["slice_idx"],
+                    #     "loss": loss.detach().cpu(),
+                    #     "pred_min": masks_pred.min().item(),
+                    #     "pred_max": masks_pred.max().item(),
+                    #     "pred_has_nan": torch.isnan(masks_pred).any().item(),
+                    #     "pred_has_inf": torch.isinf(masks_pred).any().item(),
+                    #     "image_min": images.min().item(),
+                    #     "image_max": images.max().item(),
+                    #     "mask_values": torch.unique(true_masks).tolist(),
+                    # }
+                    #return
+                    # continue   # skips backward, optimizer step, and logging entirely for this batch
+
+                #print("hello 1")
                 optimizer.zero_grad(set_to_none=True)
                 grad_scaler.scale(loss).backward()
                 grad_scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clipping)
                 grad_scaler.step(optimizer)
                 grad_scaler.update()
+                #print("bye 1")
 
+                #print("hello 2")
                 pbar.update(images.shape[0])
                 global_step += 1
                 epoch_loss += loss.item()
@@ -184,7 +226,8 @@ def train_model(
                     'epoch': epoch
                 })
                 pbar.set_postfix(**{'loss (batch)': loss.item()})
-
+                #print("bye 2")
+                
                 # Evaluation round
                 division_step = (n_train // (5 * batch_size))
                 if division_step > 0:
@@ -199,6 +242,7 @@ def train_model(
 
                         val_score = evaluate(model, val_loader, device, amp)
                         scheduler.step(val_score)
+
 
                         logging.info('Validation Dice score: {}'.format(val_score))
                         try:
@@ -222,10 +266,10 @@ def train_model(
         run_checkpoint_dir = Path(dir_checkpoint) / run_name
 
         if save_checkpoint:
-            Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
+            run_checkpoint_dir.mkdir(parents=True, exist_ok=True)
             state_dict = model.state_dict()
             state_dict['mask_values'] = dataset.mask_values
-            torch.save(state_dict, str(dir_checkpoint / 'checkpoint_epoch{}.pth'.format(epoch)))
+            torch.save(state_dict, str(run_checkpoint_dir / 'checkpoint_epoch{}.pth'.format(epoch)))
             logging.info(f'Checkpoint {epoch} saved!')
 
 
