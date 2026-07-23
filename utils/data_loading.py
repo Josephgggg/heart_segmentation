@@ -19,6 +19,7 @@ import nibabel as nib
 from collections import OrderedDict
 from scipy.ndimage import gaussian_filter, map_coordinates
 import random
+import torch.utils.data as tud
 
 def load_image(filename):
     ext = splitext(filename)[1].lower()
@@ -127,7 +128,7 @@ class BasicDataset(Dataset):
 #         super().__init__(images_dir, mask_dir, scale, mask_suffix='_mask')
 
 class VolumeMRIDataset(Dataset):
-    def __init__(self, images_dir, mask_dir, scale: float = 1.0, cache_size: int = 1000, disk_cache_dir=None):
+    def __init__(self, images_dir, mask_dir, scale: float = 1.0, cache_size: int = 4700, disk_cache_dir=None):
         self.images_dir = Path(images_dir)
         self.mask_dir = Path(mask_dir)
         self.scale = scale
@@ -171,7 +172,7 @@ class VolumeMRIDataset(Dataset):
         #    _, mask_vol = self._get_volume(patient_id)   # uses disk cache if available
         #    all_values.update(np.unique(mask_vol).tolist())
         #self.mask_values = sorted(all_values)
-        self.mask_values = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+        self.mask_values = [0.0, 1.0, 2.0, 3.0, 4.0]
         logging.info(f'Unique mask values: {self.mask_values}')
 
     def _disk_cache_paths(self, patient_id):
@@ -208,6 +209,10 @@ class VolumeMRIDataset(Dataset):
         mask_vol = np.transpose(mask_vol, (2, 0, 1))
         mask_vol = np.rot90(mask_vol[:, :, ::-1], k=1, axes=(1, 2)).astype(np.float32)
 
+        # removing fat label
+        FAT_LABEL = 5.0
+        mask_vol[mask_vol == FAT_LABEL] = 0.0   # relabel fat as background
+
         assert img_vol.shape[0] == mask_vol.shape[0], \
             f'{patient_id}: {img_vol.shape[0]} image slices vs {mask_vol.shape[0]} mask slices — mismatch'
 
@@ -219,10 +224,13 @@ class VolumeMRIDataset(Dataset):
         return img_vol, mask_vol
     
     def _get_volume(self, patient_id):
+        #worker_info = tud.get_worker_info()
+        #worker_id = worker_info.id if worker_info else 'main'
         if patient_id in self._volume_cache:
             self._volume_cache.move_to_end(patient_id)
             return self._volume_cache[patient_id]
 
+        #print(f'[worker {worker_id}] CACHE MISS — loading {patient_id}')
         img_vol, mask_vol = self._read_and_process_volume(patient_id)
         self._volume_cache[patient_id] = (img_vol, mask_vol)
         self._volume_cache.move_to_end(patient_id)
@@ -252,13 +260,19 @@ class AugmentedDataset(Dataset):
     Only wrap your TRAINING subset with this — never validation."""
 
     def __init__(self, base_dataset, rotate_prob=0.5, rotate_range=20,
-                 elastic_prob=0.5, elastic_alpha=20, elastic_sigma=4):
+                 elastic_prob=0.3, elastic_alpha=20, elastic_sigma=4,
+                 contrast_prob=0.3, contrast_range=(0.4, 1.6),
+                 noise_prob=0.3, noise_std=0.1):
         self.base_dataset = base_dataset
         self.rotate_prob = rotate_prob
         self.rotate_range = rotate_range      # max degrees, either direction
         self.elastic_prob = elastic_prob
         self.elastic_alpha = elastic_alpha    # deformation strength
         self.elastic_sigma = elastic_sigma    # smoothness of the deformation
+        self.contrast_prob = contrast_prob
+        self.contrast_range = contrast_range      # (min_factor, max_factor)
+        self.noise_prob = noise_prob
+        self.noise_std = noise_std                # std dev of gaussian noise, in normalized [0,1] intensity units
 
     def __len__(self):
         return len(self.base_dataset)
@@ -288,6 +302,19 @@ class AugmentedDataset(Dataset):
 
         return img_def[np.newaxis, ...].astype(np.float32), mask_def
 
+    def _adjust_contrast(self, img):
+        factor = random.uniform(*self.contrast_range)
+        mean = img.mean()
+        img = (img - mean) * factor + mean
+        img = np.clip(img, 0.0, 1.0)
+        return img.astype(np.float32)
+
+    def _add_intensity_noise(self, img):
+        noise = np.random.normal(loc=0.0, scale=self.noise_std, size=img.shape).astype(np.float32)
+        img = img + noise
+        img = np.clip(img, 0.0, 1.0)
+        return img.astype(np.float32)
+
     def __getitem__(self, idx):
         sample = self.base_dataset[idx]
         img = sample['image'].numpy()   # (1, H, W) float32
@@ -298,6 +325,12 @@ class AugmentedDataset(Dataset):
 
         if random.random() < self.elastic_prob:
             img, mask = self._elastic_deform(img, mask)
+
+        if random.random() < self.contrast_prob:
+            img = self._adjust_contrast(img)
+
+        if random.random() < self.noise_prob:
+            img = self._add_intensity_noise(img)
 
         return {
             'image': torch.as_tensor(img.copy()).float().contiguous(),

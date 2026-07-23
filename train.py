@@ -65,7 +65,7 @@ def train_model(
         img_scale: float = 0.5,
         amp: bool = False,
         weight_decay: float = 1e-8,
-        momentum: float = 0.999,
+        momentum: float = 0.9,
         gradient_clipping: float = 1.0,
         run_name=None,
 ):
@@ -76,6 +76,7 @@ def train_model(
     try:
         dataset = VolumeMRIDataset(dir_img, dir_mask, img_scale)
     except (AssertionError, RuntimeError, IndexError):
+        print()
         dataset = BasicDataset(dir_img, dir_mask, img_scale)
 
     # 2. Split into train / validation partitions
@@ -101,8 +102,8 @@ def train_model(
     train_set = AugmentedDataset(train_set)
 
     loader_args = dict(batch_size=batch_size, num_workers=4, pin_memory=True, persistent_workers=True)
-    train_loader = DataLoader(train_set, sampler=train_sampler, **loader_args)
-    val_loader = DataLoader(val_set, sampler=val_sampler, drop_last=False, **loader_args)
+    train_loader = DataLoader(train_set, shuffle=True, **loader_args)
+    val_loader = DataLoader(val_set, shuffle=False, drop_last=False, **loader_args)
 
     # (Initialize logging)
     experiment = wandb.init(
