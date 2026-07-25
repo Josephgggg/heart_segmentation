@@ -99,7 +99,7 @@ def train_model(
     val_sampler = PatientGroupedSampler(val_index_subset)
 
     # wrap training set with augmentation
-    train_set = AugmentedDataset(train_set)
+    #train_set = AugmentedDataset(train_set)
 
     loader_args = dict(batch_size=batch_size, num_workers=4, pin_memory=True, persistent_workers=True)
     train_loader = DataLoader(train_set, shuffle=True, **loader_args)
@@ -161,7 +161,6 @@ def train_model(
                     #print("bye")
                 #masks_pred = torch.clamp(masks_pred.float(), min=-20, max=20)
 
-                    # loss computed OUTSIDE autocast — always float32
                     if model.n_classes == 1:
                         loss = criterion(masks_pred.squeeze(1).float(), true_masks.float())
                         loss += dice_loss(F.sigmoid(masks_pred.squeeze(1).float()), true_masks.float(), multiclass=False)
@@ -261,6 +260,18 @@ def train_model(
                             })
                         except:
                             pass
+
+        # NEW — compute Dice once, cleanly, at the end of this epoch
+        epoch_val_dice = evaluate(model, val_loader, device, amp)
+        mean_epoch_loss = epoch_loss / len(train_loader)
+
+        logging.info(f'Epoch {epoch}: mean train loss = {mean_epoch_loss:.4f}, val Dice = {epoch_val_dice:.4f}')
+
+        experiment.log({
+            'epoch': epoch,
+            'epoch_train_loss': mean_epoch_loss,
+            'epoch_val_dice': epoch_val_dice,
+        })
 
         if run_name is None:
             run_name = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
