@@ -1,0 +1,379 @@
+"""Per-patient segmentation metrics (Dice + HD95) and their summary statistics.
+
+Why this exists separately from evaluate.py:
+
+evaluate.py scores slice-by-slice and averages over batches. That is fine as a
+cheap training signal, but it is not a number you can report, for two reasons:
+
+  1. A class absent from a slice scores Dice = 1.0 in dice_coeff (eps/eps), and
+     33.5% of (slice, class) pairs in this dataset are empty. Slice-wise means
+     are therefore inflated. All four structures appear in 100% of *volumes*, so
+     scoring whole volumes removes the problem instead of papering over it.
+  2. Hausdorff distance is a physical distance and only makes sense in mm on the
+     real 3D geometry, not on a stack of independent slices.
+
+So everything here works on whole patient volumes, and the unit of analysis is
+the PATIENT. Slices within a patient are highly correlated, so a standard
+deviation taken over slices is misleadingly small; take it over patients.
+"""
+
+import csv
+import logging
+import numpy as np
+import torch
+from collections import defaultdict
+from scipy.ndimage import binary_erosion, distance_transform_edt, generate_binary_structure
+from torch.utils.data import DataLoader, Subset
+
+
+def dice_binary(pred: np.ndarray, gt: np.ndarray) -> float:
+    """Dice for one binary volume pair. Returns nan if the class is absent from the ground truth."""
+    gt_n, pred_n = int(gt.sum()), int(pred.sum())
+    if gt_n == 0:
+        return float('nan')          # undefined, must not be counted as a perfect score
+    return 2.0 * float(np.logical_and(pred, gt).sum()) / (pred_n + gt_n)
+
+
+def _surface(mask: np.ndarray) -> np.ndarray:
+    footprint = generate_binary_structure(mask.ndim, 1)
+    return mask ^ binary_erosion(mask, structure=footprint, iterations=1)
+
+
+def _crop_to_union(a: np.ndarray, b: np.ndarray, pad: int = 2):
+    """Crop both volumes to the union bounding box (+pad).
+
+    The distance transform is O(volume), and these structures occupy ~1-2% of the
+    voxels, so this is a large speedup. It is exact: every surface voxel of both
+    masks lies inside the crop, so nearest-surface distances within it are correct.
+    The padding guarantees a background border, which keeps the erosion honest for
+    structures that would otherwise touch the crop edge.
+    """
+    union = a | b
+    if not union.any():
+        return a, b
+    slices = []
+    for axis, n in enumerate(union.shape):
+        idx = np.any(union, axis=tuple(i for i in range(union.ndim) if i != axis)).nonzero()[0]
+        slices.append(slice(max(0, idx[0] - pad), min(n, idx[-1] + 1 + pad)))
+    slices = tuple(slices)
+    return a[slices], b[slices]
+
+
+def _bidirectional_surface_distances(pred: np.ndarray, gt: np.ndarray, spacing):
+    """Surface distances pred->gt and gt->pred, in mm. None if either mask is empty."""
+    pred, gt = np.asarray(pred, dtype=bool), np.asarray(gt, dtype=bool)
+    if not pred.any() or not gt.any():
+        return None
+
+    pred_c, gt_c = _crop_to_union(pred, gt)
+    pred_surf, gt_surf = _surface(pred_c), _surface(gt_c)
+    if not pred_surf.any() or not gt_surf.any():
+        return None
+
+    d_pred_to_gt = distance_transform_edt(~gt_surf, sampling=spacing)[pred_surf]
+    d_gt_to_pred = distance_transform_edt(~pred_surf, sampling=spacing)[gt_surf]
+    return d_pred_to_gt, d_gt_to_pred
+
+
+def surface_metrics(pred: np.ndarray, gt: np.ndarray, spacing) -> dict:
+    """HD95 and ASSD in mm, sharing one pair of distance transforms.
+
+    Both follow the medpy convention, so they are comparable with the numbers
+    reported by the ACDC / M&Ms / BraTS challenge literature:
+      HD95 -- 95th percentile of the POOLED bidirectional distances
+              (not the max of the two one-directional percentiles).
+      ASSD -- mean of the two directional means
+              (not the mean of the pooled distances; these differ when the two
+              surfaces have different voxel counts).
+
+    Both are nan when either mask is empty -- the distance is genuinely undefined
+    there. An empty prediction against a non-empty ground truth is a total miss,
+    not a distance of 0, so callers must count those separately rather than
+    letting them silently drop out of a mean.
+    """
+    d = _bidirectional_surface_distances(pred, gt, spacing)
+    if d is None:
+        return {'hd95_mm': float('nan'), 'assd_mm': float('nan')}
+    d_pred_to_gt, d_gt_to_pred = d
+    return {
+        'hd95_mm': float(np.percentile(np.hstack((d_pred_to_gt, d_gt_to_pred)), 95)),
+        'assd_mm': float(np.mean([d_pred_to_gt.mean(), d_gt_to_pred.mean()])),
+    }
+
+
+def hd95(pred: np.ndarray, gt: np.ndarray, spacing) -> float:
+    """95th-percentile symmetric Hausdorff distance in mm. See surface_metrics()."""
+    return surface_metrics(pred, gt, spacing)['hd95_mm']
+
+
+def assd(pred: np.ndarray, gt: np.ndarray, spacing) -> float:
+    """Average symmetric surface distance in mm. See surface_metrics()."""
+    return surface_metrics(pred, gt, spacing)['assd_mm']
+
+
+@torch.inference_mode()
+def predict_volume(net, dataset, patient_indices, device, amp=False, batch_size=8, num_workers=2):
+    """Run the model over one patient's slices, in slice order, and stack to 3D."""
+    ordered = sorted(patient_indices, key=lambda i: dataset.index[i][1])
+    loader = DataLoader(Subset(dataset, ordered), batch_size=batch_size, shuffle=False,
+                        num_workers=num_workers, pin_memory=True)
+    preds, gts = [], []
+    was_training = net.training
+    net.eval()
+    for batch in loader:
+        images = batch['image'].to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
+        with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
+            logits = net(images)
+        preds.append(logits.argmax(dim=1).cpu().numpy().astype(np.uint8))
+        gts.append(batch['mask'].numpy().astype(np.uint8))
+    if was_training:
+        net.train()
+    return np.concatenate(preds), np.concatenate(gts)
+
+
+def evaluate_per_patient(net, dataset, indices, device, n_classes, amp=False,
+                         class_names=None, batch_size=8, compute_hd95=True):
+    """Score every patient covered by `indices`, one row per (patient, class).
+
+    Returns a list of dicts: patient_id, cls, class_name, dice, hd95_mm,
+    gt_voxels, pred_voxels, missed (prediction empty while ground truth is not).
+    """
+    by_patient = defaultdict(list)
+    for i in indices:
+        by_patient[dataset.index[i][0]].append(i)
+
+    rows = []
+    for n, (patient_id, idxs) in enumerate(sorted(by_patient.items()), start=1):
+        pred_vol, gt_vol = predict_volume(net, dataset, idxs, device, amp=amp, batch_size=batch_size)
+        spacing = dataset.spacing_for(patient_id)
+        logging.info(f'  [{n}/{len(by_patient)}] {patient_id}: {pred_vol.shape[0]} slices, '
+                     f'spacing {tuple(round(s, 4) for s in spacing)} mm')
+
+        for cls in range(1, n_classes):       # class 0 is background
+            pred_c, gt_c = pred_vol == cls, gt_vol == cls
+            surf = (surface_metrics(pred_c, gt_c, spacing) if compute_hd95
+                    else {'hd95_mm': float('nan'), 'assd_mm': float('nan')})
+            rows.append({
+                'patient_id': patient_id,
+                'cls': cls,
+                'class_name': (class_names or {}).get(cls, f'class_{cls}'),
+                'dice': dice_binary(pred_c, gt_c),
+                'hd95_mm': surf['hd95_mm'],
+                'assd_mm': surf['assd_mm'],
+                'gt_voxels': int(gt_c.sum()),
+                'pred_voxels': int(pred_c.sum()),
+                'voxel_ml': float(np.prod(spacing)) / 1000.0,   # for volume agreement
+                'missed': bool(gt_c.any() and not pred_c.any()),
+            })
+    return rows
+
+
+def summarise(rows, metrics=('dice', 'hd95_mm', 'assd_mm')):
+    """Mean / SD / median / IQR across PATIENTS, per class, plus an all-class row.
+
+    n is the number of patients actually contributing (nan values are excluded),
+    so you can see when a statistic rests on very few patients. `n_missed` counts
+    patients where the structure exists but the model predicted nothing for it --
+    those have no defined HD95 and would otherwise vanish from the mean, making
+    the model look better the more badly it fails.
+    """
+    out = []
+    by_class = defaultdict(list)
+    for r in rows:
+        by_class[(r['cls'], r['class_name'])].append(r)
+
+    def stats(vals):
+        vals = np.asarray([v for v in vals if not np.isnan(v)], dtype=float)
+        if vals.size == 0:
+            return dict(n=0, mean=float('nan'), sd=float('nan'),
+                        median=float('nan'), q1=float('nan'), q3=float('nan'))
+        return dict(n=int(vals.size), mean=float(vals.mean()),
+                    sd=float(vals.std(ddof=1)) if vals.size > 1 else float('nan'),
+                    median=float(np.median(vals)),
+                    q1=float(np.percentile(vals, 25)), q3=float(np.percentile(vals, 75)))
+
+    for (cls, name), group in sorted(by_class.items()):
+        row = {'cls': cls, 'class_name': name,
+               'n_patients': len(group),
+               'n_missed': sum(r['missed'] for r in group)}
+        for m in metrics:
+            for k, v in stats([r[m] for r in group]).items():
+                row[f'{m}_{k}'] = v
+        out.append(row)
+
+    # macro average over classes, computed per patient first so each patient counts once
+    per_patient = defaultdict(dict)
+    for r in rows:
+        for m in metrics:
+            per_patient[r['patient_id']].setdefault(m, []).append(r[m])
+    row = {'cls': -1, 'class_name': 'all_classes_macro',
+           'n_patients': len(per_patient),
+           'n_missed': sum(r['missed'] for r in rows)}
+    for m in metrics:
+        means = [np.nanmean(v[m]) if not np.all(np.isnan(v[m])) else float('nan')
+                 for v in per_patient.values()]
+        for k, v in stats(means).items():
+            row[f'{m}_{k}'] = v
+    out.append(row)
+    return out
+
+
+def format_summary(summary, metrics=('dice', 'hd95_mm', 'assd_mm')):
+    """Human-readable 'mean +/- SD' table, ready to paste into notes or a paper."""
+    def cell(m, r):
+        if not r[f'{m}_n']:
+            return f'{"n/a":>21}'
+        dp = 4 if m == 'dice' else 2
+        return f'{r[f"{m}_mean"]:>10.{dp}f} +/- {r[f"{m}_sd"]:<8.{dp}f}'
+
+    lines = [f'{"class":<20}{"n":>4}{"missed":>8}' + ''.join(f'{m:>21}' for m in metrics)]
+    for r in summary:
+        lines.append(f'{r["class_name"]:<20}{r["n_patients"]:>4}{r["n_missed"]:>8}'
+                     + ''.join(cell(m, r) for m in metrics))
+    return '\n'.join(lines)
+
+
+def load_per_patient(path):
+    """Read a *_metrics_per_patient.csv back, with numeric columns parsed."""
+    rows = []
+    with open(path) as f:
+        for r in csv.DictReader(f):
+            for k in ('dice', 'hd95_mm', 'assd_mm', 'voxel_ml'):
+                if k in r:
+                    r[k] = float(r[k]) if r[k] not in ('', 'nan') else float('nan')
+            for k in ('cls', 'gt_voxels', 'pred_voxels'):
+                if k in r and r[k] != '':
+                    r[k] = int(r[k])
+            if 'missed' in r:
+                r['missed'] = str(r['missed']).lower() == 'true'
+            rows.append(r)
+    return rows
+
+
+def _holm(pvals):
+    """Holm-Bonferroni step-down adjusted p-values, returned in the input order."""
+    m = len(pvals)
+    adj, running = [0.0] * m, 0.0
+    for rank, i in enumerate(sorted(range(m), key=lambda j: pvals[j])):
+        running = max(running, (m - rank) * pvals[i])
+        adj[i] = min(1.0, running)
+    return adj
+
+
+def compare_runs(path_a, path_b, label_a='A', label_b='B',
+                 metrics=('dice', 'hd95_mm', 'assd_mm')):
+    """Paired Wilcoxon signed-rank comparison of two runs scored on the SAME patients.
+
+    Pairs rows on (patient_id, class_name). Paired is the right test here: both
+    models score the same patients, and pairing removes between-patient variance,
+    which dominates everything else at this sample size.
+
+    IMPORTANT sample-size limit. The two-sided exact Wilcoxon test on n pairs
+    cannot return a p below 2 / 2**n. At n = 7 patients that floor is 0.0156, so:
+      - a single pre-specified test (use the all_classes_macro row) CAN reach
+        p < 0.05, but only if every patient moves the same way;
+      - the 12 per-chamber x per-metric tests CANNOT, because Holm multiplies the
+        smallest p by 12 -> 0.19. Treat those as descriptive, not confirmatory.
+    Holm correction is therefore applied across the per-chamber tests only, and
+    the macro row is left uncorrected as the single primary endpoint.
+
+    Returns a list of dicts, one per (class, metric), macro row last.
+    """
+    from scipy.stats import wilcoxon
+
+    a = {(r['patient_id'], r['class_name']): r for r in load_per_patient(path_a)}
+    b = {(r['patient_id'], r['class_name']): r for r in load_per_patient(path_b)}
+    shared = sorted(set(a) & set(b))
+    if not shared:
+        raise ValueError('No shared (patient, class) pairs between the two runs. '
+                         'Were they scored on the same split? Check split_seed.')
+    if set(a) - set(b) or set(b) - set(a):
+        logging.warning(f'{len(set(a) - set(b))} pairs only in {label_a}, '
+                        f'{len(set(b) - set(a))} only in {label_b}; '
+                        f'comparing the {len(shared)} shared pairs only')
+
+    def test(va, vb):
+        va, vb = np.asarray(va, float), np.asarray(vb, float)
+        ok = ~(np.isnan(va) | np.isnan(vb))
+        va, vb = va[ok], vb[ok]
+        p = float('nan')
+        if va.size and np.any(vb - va):
+            try:
+                p = float(wilcoxon(va, vb).pvalue)
+            except ValueError:
+                p = float('nan')
+        return va, vb, p
+
+    out = []
+    for cls in sorted({c for _, c in shared}):
+        keys = [k for k in shared if k[1] == cls]
+        for m in metrics:
+            va, vb, p = test([a[k][m] for k in keys], [b[k][m] for k in keys])
+            out.append({'class_name': cls, 'metric': m, 'n_pairs': int(va.size),
+                        f'median_{label_a}': float(np.median(va)) if va.size else float('nan'),
+                        f'median_{label_b}': float(np.median(vb)) if vb.size else float('nan'),
+                        'median_diff': float(np.median(vb - va)) if va.size else float('nan'),
+                        'p_value': p, 'primary': False})
+
+    # Holm across the per-chamber family only
+    idx = [i for i, r in enumerate(out) if not np.isnan(r['p_value'])]
+    for r in out:
+        r['p_holm'] = float('nan')
+    for i, v in zip(idx, _holm([out[i]['p_value'] for i in idx])):
+        out[i]['p_holm'] = v
+
+    # macro: average each patient over chambers first, then one test per metric
+    patients = sorted({p for p, _ in shared})
+    for m in metrics:
+        ma = [np.nanmean([a[k][m] for k in shared if k[0] == p]) for p in patients]
+        mb = [np.nanmean([b[k][m] for k in shared if k[0] == p]) for p in patients]
+        va, vb, p = test(ma, mb)
+        out.append({'class_name': 'all_classes_macro', 'metric': m, 'n_pairs': int(va.size),
+                    f'median_{label_a}': float(np.median(va)) if va.size else float('nan'),
+                    f'median_{label_b}': float(np.median(vb)) if vb.size else float('nan'),
+                    'median_diff': float(np.median(vb - va)) if va.size else float('nan'),
+                    'p_value': p, 'p_holm': float('nan'), 'primary': True})
+    return out
+
+
+def format_comparison(comparison, label_a='A', label_b='B'):
+    """Readable paired-comparison table. '*' marks the pre-specified primary endpoint."""
+    ka, kb = f'median_{label_a}', f'median_{label_b}'
+    lines = [f'{"class":<20}{"metric":<10}{"n":>3}{label_a:>12}{label_b:>12}'
+             f'{"diff":>10}{"p":>10}{"p_holm":>10}',
+             f'{"-" * 87}']
+    for r in comparison:
+        dp = 4 if r['metric'] == 'dice' else 2
+        ph = f'{r["p_holm"]:.4f}' if not np.isnan(r['p_holm']) else ('primary' if r['primary'] else '-')
+        pv = f'{r["p_value"]:.4f}' if not np.isnan(r['p_value']) else 'n/a'
+        star = '*' if r['primary'] else ' '
+        lines.append(f'{star + r["class_name"]:<20}{r["metric"]:<10}{r["n_pairs"]:>3}'
+                     f'{r[ka]:>12.{dp}f}{r[kb]:>12.{dp}f}{r["median_diff"]:>+10.{dp}f}'
+                     f'{pv:>10}{ph:>10}')
+    return '\n'.join(lines)
+
+
+def write_csv(rows, path):
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    logging.info(f'Wrote {len(rows)} rows to {path}')
+
+
+def report(net, dataset, indices, device, n_classes, out_dir=None, split_name='test',
+           amp=False, class_names=None, batch_size=8, compute_hd95=True):
+    """Score a split per patient, write both CSVs, and return (rows, summary)."""
+    logging.info(f'Scoring {split_name} split per patient (Dice + {"HD95" if compute_hd95 else "no HD95"})...')
+    rows = evaluate_per_patient(net, dataset, indices, device, n_classes, amp=amp,
+                                class_names=class_names, batch_size=batch_size,
+                                compute_hd95=compute_hd95)
+    summary = summarise(rows)
+    logging.info(f'\n{split_name} results (mean +/- SD across patients):\n{format_summary(summary)}')
+    if out_dir is not None:
+        write_csv(rows, out_dir / f'{split_name}_metrics_per_patient.csv')
+        write_csv(summary, out_dir / f'{split_name}_metrics_summary.csv')
+    return rows, summary

@@ -179,6 +179,24 @@ class VolumeMRIDataset(Dataset):
         return (self.disk_cache_dir / f'{patient_id}_img.npy',
                 self.disk_cache_dir / f'{patient_id}_mask.npy')
 
+    def spacing_for(self, patient_id):
+        """Voxel spacing in mm as (slice, row, col), accounting for self.scale.
+
+        Read lazily from the DICOM header only (stop_before_pixels), so this stays
+        cheap even though the pixel data usually comes from the .npy disk cache.
+        Spacing is NOT uniform across this dataset, so never hardcode it.
+        """
+        if not hasattr(self, '_spacing_cache'):
+            self._spacing_cache = {}
+        if patient_id not in self._spacing_cache:
+            ds = pydicom.dcmread(self.images_dir / f'{patient_id}.dcm', stop_before_pixels=True)
+            row_mm, col_mm = (float(v) for v in ds.PixelSpacing)
+            slice_mm = float(getattr(ds, 'SpacingBetweenSlices', None)
+                             or getattr(ds, 'SliceThickness', 1.0))
+            # preprocess() resizes in-plane by self.scale; slice axis is untouched
+            self._spacing_cache[patient_id] = (slice_mm, row_mm / self.scale, col_mm / self.scale)
+        return self._spacing_cache[patient_id]
+
     def __len__(self):
         return len(self.index)
 
