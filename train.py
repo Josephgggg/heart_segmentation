@@ -19,10 +19,11 @@ import wandb
 from evaluate import evaluate
 from unet import UNet
 from utils.data_loading import BasicDataset, VolumeMRIDataset
-from utils.dice_score import dice_loss
+from utils.losses import LOSS_REGISTRY, build_loss, loss_name
 from utils import metrics
 
 import re
+import numpy as np
 from collections import defaultdict
 from torch.utils.data import Subset
 from torch.utils.data import Sampler
@@ -59,6 +60,53 @@ class PatientGroupedSampler(Sampler):
 
     def __len__(self):
         return len(self.index_subset)
+
+
+def set_seed(seed: int = 0, deterministic: bool = False):
+    """Seed every RNG that affects a training run.
+
+    Call this BEFORE constructing the model -- weight initialisation consumes the
+    torch RNG, so seeding only inside train_model leaves the initial weights
+    random and two "identical" runs will still differ.
+
+    `deterministic=True` additionally restricts cuDNN to reproducible conv
+    algorithms. That costs speed, so it is off by default; the seeds above
+    already remove the large sources of variance (init, batch order,
+    augmentation), leaving only small floating-point non-associativity.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    logging.info(f'Seeded RNGs with {seed}' + (' (cuDNN deterministic)' if deterministic else ''))
+
+
+def seed_worker(worker_id):
+    """Give each DataLoader worker a distinct, reproducible numpy/random state.
+
+    PyTorch reseeds `torch` per worker automatically. The other two RNGs behave
+    differently on fork, and both are wrong for us:
+
+      numpy  -- inherited from the parent, so every worker replays the SAME
+                np.random stream. In AugmentedDataset that is the elastic
+                deformation fields (np.random.rand) and the Gaussian noise
+                (np.random.normal): with num_workers=4 there are roughly 4x
+                fewer distinct warp fields and noise patterns than intended.
+      random -- CPython registers os.register_at_fork(after_in_child=seed), so
+                each worker is reseeded from OS entropy. That avoids duplication
+                but makes the rotation angles and contrast factors
+                irreproducible: identical settings give different augmentation
+                every run.
+
+    Seeding both from torch.initial_seed() (which is base_seed + worker_id, so
+    distinct per worker) fixes duplication and irreproducibility together.
+    """
+    worker_seed = torch.initial_seed() % 2 ** 32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 def build_dataset(img_scale: float = 0.5):
@@ -134,7 +182,19 @@ def train_model(
         eval_test: bool = True,
         per_patient_metrics: bool = True,
         class_names=None,
+        seed: int = 0,
+        deterministic: bool = False,
+        loss: str = 'dice_ce',
+        select_on: str = 'macro_dice',
 ):
+    # 0. Reseed. NOTE: the caller built the model, so its weights were already
+    # drawn -- call set_seed() before UNet(...) too for a bit-comparable run.
+    set_seed(seed, deterministic)
+
+    # Resolve the arm's name up front: the training loop below rebinds `loss` to
+    # the per-batch tensor, so reading it afterwards would report "Tensor".
+    loss_label = loss_name(loss)
+
     # 1. Create dataset
     if dataset is None:
         dataset = build_dataset(img_scale)
@@ -154,8 +214,15 @@ def train_model(
     if augment:
         train_set = AugmentedDataset(train_set)
 
-    loader_args = dict(batch_size=batch_size, num_workers=4, pin_memory=True, persistent_workers=True)
-    train_loader = DataLoader(train_set, shuffle=True, **loader_args)
+    # `generator` makes the shuffle order reproducible; `worker_init_fn` gives each
+    # worker its own numpy/random stream (see seed_worker -- this is also what
+    # stops the four workers augmenting in lockstep).
+    loader_generator = torch.Generator()
+    loader_generator.manual_seed(seed)
+
+    loader_args = dict(batch_size=batch_size, num_workers=4, pin_memory=True,
+                       persistent_workers=True, worker_init_fn=seed_worker)
+    train_loader = DataLoader(train_set, shuffle=True, generator=loader_generator, **loader_args)
     val_loader = DataLoader(val_set, shuffle=False, drop_last=False, **loader_args)
     # the test loader is built once at the very end, so it gets no persistent workers
 
@@ -173,9 +240,11 @@ def train_model(
         'gradient_clipping': gradient_clipping,
         'optimizer': 'RMSprop', 'scheduler': 'ReduceLROnPlateau(max, patience=5)',
         'img_scale': img_scale, 'amp': amp, 'augment': augment,
+        'loss': loss_label, 'select_on': select_on,
         'n_classes': model.n_classes, 'n_channels': model.n_channels,
         'bilinear': model.bilinear,
         'val_percent': val_percent, 'test_percent': test_percent, 'split_seed': split_seed,
+        'seed': seed, 'deterministic': deterministic,
         'n_train': n_train, 'n_val': n_val, 'n_test': n_test,
         'train_patients': sorted({dataset.index[i][0] for i in train_idx}),
         'val_patients': sorted({dataset.index[i][0] for i in val_idx}),
@@ -197,6 +266,7 @@ def train_model(
         dict(epochs=epochs, batch_size=batch_size, learning_rate=learning_rate,
              val_percent=val_percent, test_percent=test_percent, split_seed=split_seed,
              save_checkpoint=save_checkpoint, img_scale=img_scale, amp=amp, augment=augment,
+             loss=loss_label, select_on=select_on,
              n_train=n_train, n_val=n_val, n_test=n_test)
     )
 
@@ -208,6 +278,8 @@ def train_model(
         Validation size: {n_val}
         Test size:       {n_test} (held out, {'scored once after training' if eval_test else 'not scored'})
         Augmentation:    {augment}
+        Loss:            {loss_label}
+        Select best on:  {select_on}
         Checkpoints:     {save_checkpoint}
         Device:          {device.type}
         Images scaling:  {img_scale}
@@ -219,10 +291,13 @@ def train_model(
                               lr=learning_rate, weight_decay=weight_decay, momentum=momentum, foreach=True)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=5)  # goal: maximize Dice score
     grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
-    criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss()
+    # One ablation arm, resolved from its registry name (see utils/losses.py).
+    criterion = build_loss(loss, model.n_classes)
     global_step = 0
     batch_skip_count = 0
     best_val_dice = 0.0
+    best_val_macro_dice = float('nan')
+    best_selection_score = -float('inf')
     best_epoch = 0
     best_state = None
     history = []
@@ -230,6 +305,8 @@ def train_model(
     # 5. Begin training
     for epoch in range(1, epochs + 1):
         model.train()
+        # lets scheduled losses (the boundary arm) advance their weighting
+        criterion.on_epoch_start(epoch, epochs)
         epoch_loss = 0
         with tqdm(total=n_train, desc=f'Epoch {epoch}/{epochs}', unit='img') as pbar:
             for batch in train_loader:
@@ -246,21 +323,13 @@ def train_model(
                 true_masks = true_masks.to(device=device, dtype=torch.long)
 
                 with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
-                    #print("hello")
                     masks_pred = model(images)
-                    #print("bye")
-                #masks_pred = torch.clamp(masks_pred.float(), min=-20, max=20)
 
-                    if model.n_classes == 1:
-                        loss = criterion(masks_pred.squeeze(1).float(), true_masks.float())
-                        loss += dice_loss(F.sigmoid(masks_pred.squeeze(1).float()), true_masks.float(), multiclass=False)
-                    else:
-                        loss = criterion(masks_pred.float(), true_masks)
-                        loss += dice_loss(
-                            F.softmax(masks_pred.float(), dim=1),
-                            F.one_hot(true_masks, model.n_classes).permute(0, 3, 1, 2).float(),
-                            multiclass=True
-                        )
+                # The loss is computed OUTSIDE autocast, in fp32. The reductions in
+                # a Dice-family loss are the numerically fragile part, and under
+                # autocast the .float() casts inside them do not reliably keep the
+                # accumulation in fp32.
+                loss = criterion(masks_pred, true_masks)
 
                 # if not torch.isfinite(loss):
                 #     batch_skip_count += 1
@@ -351,24 +420,49 @@ def train_model(
                         except:
                             pass
 
-        # NEW — compute Dice once, cleanly, at the end of this epoch
-        epoch_val_dice = evaluate(model, val_loader, device, amp)
+        # End-of-epoch scoring. Two numbers, for two different jobs:
+        #   epoch_val_dice       -- slice-wise, from evaluate.py. Kept only for
+        #                           continuity with earlier runs. Inflated.
+        #   epoch_val_macro_dice -- per-patient, per-class, whole-volume. This is
+        #                           what selects the checkpoint.
+        # Selecting on the slice-wise number would bias a loss ablation: it scores
+        # an absent class as 1.0, so it rewards predicting nothing on empty slices,
+        # and empty-class handling is precisely what the arms differ in.
+        epoch_val_dice = float(evaluate(model, val_loader, device, amp))
         mean_epoch_loss = epoch_loss / len(train_loader)
 
-        logging.info(f'Epoch {epoch}: mean train loss = {mean_epoch_loss:.4f}, val Dice = {epoch_val_dice:.4f}')
+        epoch_val_macro_dice = float('nan')
+        if hasattr(dataset, 'index') and n_val > 0:
+            epoch_val_macro_dice = metrics.macro_dice(
+                model, dataset, val_idx, device, n_classes=model.n_classes,
+                amp=amp, batch_size=batch_size,
+            )
 
-        epoch_val_dice = float(epoch_val_dice)
-        history.append({'epoch': epoch, 'train_loss': mean_epoch_loss, 'val_dice': epoch_val_dice})
+        selection_score = (epoch_val_dice if select_on == 'slice_dice'
+                           else epoch_val_macro_dice)
+        if not np.isfinite(selection_score):        # no val patients, or the cheap path failed
+            selection_score = epoch_val_dice
+
+        logging.info(f'Epoch {epoch}: mean train loss = {mean_epoch_loss:.4f}, '
+                     f'val Dice (slice) = {epoch_val_dice:.4f}, '
+                     f'val Dice (per-patient macro) = {epoch_val_macro_dice:.4f}')
+
+        history.append({'epoch': epoch, 'train_loss': mean_epoch_loss,
+                        'val_dice': epoch_val_dice,
+                        'val_macro_dice': epoch_val_macro_dice})
 
         experiment.log({
             'epoch': epoch,
             'epoch_train_loss': mean_epoch_loss,
             'epoch_val_dice': epoch_val_dice,
+            'epoch_val_macro_dice': epoch_val_macro_dice,
         })
 
-        is_best = epoch_val_dice > best_val_dice
+        is_best = selection_score > best_selection_score
         if is_best:
-            best_val_dice, best_epoch = epoch_val_dice, epoch
+            best_selection_score, best_epoch = selection_score, epoch
+            best_val_dice = epoch_val_dice
+            best_val_macro_dice = epoch_val_macro_dice
             # keep the best weights in RAM so the test set can be scored with them
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
@@ -386,10 +480,13 @@ def train_model(
     # Treat this as a final report, not something to tune against.
     test_dice = None
     per_patient_results = {}
+
+    # Everything below is scored with the best-VALIDATION weights, not the last epoch.
+    if best_state is not None:
+        model.load_state_dict(best_state)
+        logging.info(f'Loaded best weights (epoch {best_epoch}) for final scoring')
+
     if eval_test and n_test > 0:
-        if best_state is not None:
-            model.load_state_dict(best_state)
-            logging.info(f'Loaded best weights (epoch {best_epoch}) for test evaluation')
         test_loader = DataLoader(test_set, shuffle=False, drop_last=False,
                                  batch_size=batch_size, num_workers=4, pin_memory=True)
         test_dice = float(evaluate(model, test_loader, device, amp))
@@ -397,31 +494,40 @@ def train_model(
                      f'(val Dice was {best_val_dice:.4f} at epoch {best_epoch})')
         experiment.summary['test_dice'] = test_dice
 
-        # Reportable metrics: per patient, per class, in 3D, Dice + HD95 in mm.
-        # The slice-wise number above is inflated by empty classes scoring 1.0,
-        # so use these for anything you actually publish.
-        if per_patient_metrics and hasattr(dataset, 'spacing_for'):
-            for split_name, split_idx in (('val', val_idx), ('test', test_idx)):
-                rows, summary = metrics.report(
-                    model, dataset, split_idx, device, n_classes=model.n_classes,
-                    out_dir=run_checkpoint_dir, split_name=split_name, amp=amp,
-                    class_names=CLASS_NAMES if class_names is None else class_names,
-                    batch_size=batch_size,
-                )
-                per_patient_results[split_name] = {'rows': rows, 'summary': summary}
-                for r in summary:
-                    experiment.summary[f'{split_name}/{r["class_name"]}/dice_mean'] = r['dice_mean']
-                    experiment.summary[f'{split_name}/{r["class_name"]}/dice_sd'] = r['dice_sd']
-                    experiment.summary[f'{split_name}/{r["class_name"]}/hd95_mean'] = r['hd95_mm_mean']
-                    experiment.summary[f'{split_name}/{r["class_name"]}/hd95_sd'] = r['hd95_mm_sd']
+    # Reportable metrics: per patient, per class, in 3D, Dice + HD95 in mm.
+    # The slice-wise numbers above are inflated by empty classes scoring 1.0, so
+    # use these for anything you actually publish.
+    #
+    # val is scored unconditionally -- it is what a loss ablation compares, and
+    # gating it on eval_test would leave `eval_test=False` runs with no CSVs at
+    # all. test is scored only when eval_test, so an ablation never touches it.
+    if per_patient_metrics and hasattr(dataset, 'spacing_for'):
+        splits = [('val', val_idx)] if n_val > 0 else []
+        if eval_test and n_test > 0:
+            splits.append(('test', test_idx))
+        for split_name, split_idx in splits:
+            rows, summary = metrics.report(
+                model, dataset, split_idx, device, n_classes=model.n_classes,
+                out_dir=run_checkpoint_dir, split_name=split_name, amp=amp,
+                class_names=CLASS_NAMES if class_names is None else class_names,
+                batch_size=batch_size,
+            )
+            per_patient_results[split_name] = {'rows': rows, 'summary': summary}
+            for r in summary:
+                experiment.summary[f'{split_name}/{r["class_name"]}/dice_mean'] = r['dice_mean']
+                experiment.summary[f'{split_name}/{r["class_name"]}/dice_sd'] = r['dice_sd']
+                experiment.summary[f'{split_name}/{r["class_name"]}/hd95_mean'] = r['hd95_mm_mean']
+                experiment.summary[f'{split_name}/{r["class_name"]}/hd95_sd'] = r['hd95_mm_sd']
 
     experiment.summary['best_val_dice'] = best_val_dice
+    experiment.summary['best_val_macro_dice'] = best_val_macro_dice
     experiment.summary['best_epoch'] = best_epoch
     experiment.finish()
 
     run_config.update({
         'finished': datetime.datetime.now().isoformat(timespec='seconds'),
         'best_val_dice': best_val_dice,
+        'best_val_macro_dice': best_val_macro_dice,
         'best_epoch': best_epoch,
         'final_val_dice': history[-1]['val_dice'] if history else None,
         'test_dice_slicewise': test_dice,
@@ -433,7 +539,9 @@ def train_model(
     return {
         'run_name': run_name,
         'checkpoint_dir': run_checkpoint_dir,
+        'loss': loss_label,
         'best_val_dice': best_val_dice,
+        'best_val_macro_dice': best_val_macro_dice,
         'best_epoch': best_epoch,
         'final_val_dice': history[-1]['val_dice'] if history else None,
         'test_dice': test_dice,
@@ -471,6 +579,19 @@ def get_args():
                              'or the held-out test set changes between runs')
     parser.add_argument('--no-test-eval', dest='eval_test', action='store_false', default=True,
                         help='Skip scoring the test set after training')
+    parser.add_argument('--seed', type=int, default=0,
+                        help='Seed for model init, batch order and augmentation. Vary this '
+                             '(with --split-seed fixed) to measure run-to-run variance')
+    parser.add_argument('--deterministic', action='store_true', default=False,
+                        help='Also force deterministic cuDNN algorithms (slower)')
+    parser.add_argument('--loss', type=str, default='dice_ce', choices=sorted(LOSS_REGISTRY),
+                        help='Loss function / ablation arm (see utils/losses.py). '
+                             '"dice_ce" is the corrected per-class batch Dice + CE; '
+                             '"dice_ce_legacy" reproduces the pre-fix pooled Dice')
+    parser.add_argument('--select-on', dest='select_on', type=str, default='macro_dice',
+                        choices=['macro_dice', 'slice_dice'],
+                        help='Metric used to pick best.pth. Keep this identical across '
+                             'every arm of an ablation')
 
     return parser.parse_args()
 
@@ -481,6 +602,10 @@ if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logging.info(f'Using device {device}')
+
+    # seed BEFORE building the model -- UNet(...) draws its initial weights from
+    # the torch RNG, so seeding afterwards would leave the init random
+    set_seed(args.seed, args.deterministic)
 
     # Change here to adapt to your data
     # n_channels=3 for RGB images
@@ -513,6 +638,10 @@ if __name__ == '__main__':
         amp=args.amp,
         augment=args.augment,
         run_name=args.run_name,
+        seed=args.seed,
+        deterministic=args.deterministic,
+        loss=args.loss,
+        select_on=args.select_on,
     )
     try:
         train_model(model=model, **train_kwargs)

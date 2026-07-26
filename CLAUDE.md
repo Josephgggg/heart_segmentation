@@ -20,8 +20,9 @@ Train:
 python train.py --amp                      # mixed precision, recommended
 python train.py --epochs 40 --batch-size 8 --scale 1.0 --classes 5 --amp --run-name baseline
 python train.py --validation 15 --test 15  # percent of PATIENTS for val / test
+python train.py --loss tversky_ce --no-test-eval   # one arm of the loss ablation
 ```
-Run `python train.py -h` for the full flag list (`--load` to resume from a `.pth` checkpoint, `--bilinear` for bilinear upsampling instead of transposed conv, `--augment` to enable training-set augmentation, `--split-seed` to change the patient shuffle, `--no-test-eval` to skip the final test scoring).
+Run `python train.py -h` for the full flag list (`--load` to resume from a `.pth` checkpoint, `--bilinear` for bilinear upsampling instead of transposed conv, `--augment` to enable training-set augmentation, `--split-seed` to change the patient shuffle, `--no-test-eval` to skip the final test scoring, `--loss` to pick the loss arm, `--select-on` to change the checkpoint-selection metric).
 
 Predict:
 ```bash
@@ -59,15 +60,48 @@ The test set is scored exactly once, after training, using the **best-validation
 
 Note: `CADRE_1116`, `CADRE_1382`, `CADRE_1395`, and `CADRE_1404` each have two scan files (`_first`/`_second`), so 49 files cover 45 distinct subjects. These are deliberately treated as **independent patients** for splitting — two scans of the same subject can land in different sets.
 
-`train_model` returns a results dict: best/final val Dice, best epoch, `test_dice`, set sizes, the val and test patient lists, and per-epoch `history`.
+`train_model` returns a results dict: `loss` (the arm name), best/final val Dice, `best_val_macro_dice`, best epoch, `test_dice`, set sizes, the val and test patient lists, and per-epoch `history`.
 
 `AugmentedDataset` wraps the training subset (never validation) and applies, per sample, optional random rotation, elastic deformation, contrast jitter, and Gaussian intensity noise — img/mask pairs are transformed identically for the geometric ops. Enable it via `augment=True` / `--augment`; it is **off** by default.
 
+## Seeding
+
+`set_seed(seed, deterministic=False)` seeds `random`, `numpy`, `torch` and CUDA. **Call it before constructing the model** — `UNet(...)` draws its initial weights from the torch RNG, so seeding only inside `train_model` leaves the init random. Both `train.py`'s `__main__` and the notebook do this. `--seed` / `seed=` varies model init, batch order and augmentation; `--split-seed` is separate and controls only the patient split (keep it fixed).
+
+`seed_worker` is passed as the DataLoader `worker_init_fn`, and the train loader gets an explicit seeded `generator`. This is not cosmetic — on fork the two non-torch RNGs misbehave in opposite ways:
+
+- **numpy is inherited**, so every worker replays the *same* `np.random` stream. In `AugmentedDataset` that covers the elastic deformation fields and the Gaussian noise, so with `num_workers=4` there were ~4× fewer distinct warp fields and noise patterns than intended.
+- **Python's `random` is auto-reseeded from OS entropy** (CPython registers `os.register_at_fork(after_in_child=seed)`), so rotation angles and contrast factors were never reproducible run-to-run.
+
+`seed_worker` seeds both from `torch.initial_seed()` (= `base_seed + worker_id`, distinct per worker), fixing duplication and irreproducibility together. Runs before this change used `augment=False` and are unaffected; older augmented runs (`20_epoch_data_aug`, `data_aug_20_epoch`) predate the fix.
+
+`deterministic=True` additionally restricts cuDNN to reproducible conv algorithms, which costs speed; the seeds alone remove the large variance sources, so it is off by default.
+
 **Preprocessing** (`BasicDataset.preprocess`, shared by both dataset classes): images are per-slice robust-normalized using the 0.5th/99.5th percentile (not global min/max) before scaling; masks are resized with nearest-neighbor and re-mapped through `mask_values` to contiguous class indices.
 
-**Training loop** (`train.py`): RMSprop optimizer, `ReduceLROnPlateau` scheduler keyed on validation Dice, AMP via `torch.autocast`/`GradScaler`, gradient clipping (`clip_grad_norm_`), combined `CrossEntropyLoss`/`BCEWithLogitsLoss` + Dice loss (`utils/dice_score.py`). Validation runs **both** mid-epoch (every `n_train // (5 * batch_size)` steps, ≈5×/epoch) and once at epoch end. `scheduler.step()` is called *only* in the mid-epoch block, so `ReduceLROnPlateau(patience=5)` is counted in mid-epoch evaluations (≈1 epoch), not in epochs — with the default `factor=0.1` the LR drops 10× after roughly one stagnant epoch. This is deliberate and matches the runs that produced the existing checkpoints; if you move `scheduler.step()` to epoch end, raise `patience` to keep the LR schedule comparable. The mid-epoch block also logs weight/gradient histograms for every parameter, which is the bulk of its cost. Checkpoints save to `checkpoints/<run_name>/checkpoint_epoch<N>.pth`, where `run_name` defaults to a timestamp; a `best.pth` copy of the highest-val-Dice epoch is also written. The state dict has `mask_values` injected into it, so `predict.py`/reload code must `pop`/`del` that key before calling `load_state_dict`.
+**Training loop** (`train.py`): RMSprop optimizer, `ReduceLROnPlateau` scheduler keyed on validation Dice, AMP via `torch.autocast`/`GradScaler`, gradient clipping (`clip_grad_norm_`), and a loss selected from `utils/losses.py` (see **Losses** below; the loss is computed *outside* the autocast block, in fp32). Validation runs **both** mid-epoch (every `n_train // (5 * batch_size)` steps, ≈5×/epoch) and once at epoch end. `scheduler.step()` is called *only* in the mid-epoch block, so `ReduceLROnPlateau(patience=5)` is counted in mid-epoch evaluations (≈1 epoch), not in epochs — with the default `factor=0.1` the LR drops 10× after roughly one stagnant epoch. This is deliberate and matches the runs that produced the existing checkpoints; if you move `scheduler.step()` to epoch end, raise `patience` to keep the LR schedule comparable. The mid-epoch block also logs weight/gradient histograms for every parameter, which is the bulk of its cost. Checkpoints save to `checkpoints/<run_name>/checkpoint_epoch<N>.pth`, where `run_name` defaults to a timestamp; a `best.pth` copy of the best epoch is also written. **Best is chosen on per-patient macro Dice** (`metrics.macro_dice`, whole-volume, foreground classes), not on `evaluate.py`'s slice-wise Dice — `--select-on slice_dice` restores the old behaviour. The slice-wise number scores an absent class as 1.0, so selecting on it rewards predicting nothing on empty slices; that biases any comparison between losses that differ in empty-class handling. Both numbers are logged per epoch (`val_dice`, `val_macro_dice` in `history`). The state dict has `mask_values` injected into it, so `predict.py`/reload code must `pop`/`del` that key before calling `load_state_dict`.
 
 There's dead/commented-out code throughout `train.py`'s training loop (debug prints, an early-return dict, a disabled non-finite-loss skip) — treat as scratch history, not something to preserve when editing nearby.
+
+## Losses
+
+`utils/losses.py` holds every loss and the `LOSS_REGISTRY` that names them. Select with `--loss <key>` or `train_model(loss='<key>')`; `loss=` also accepts an already-built loss object. The chosen arm is recorded in `run_config.json` and in the returned dict.
+
+**Hyperparameters live in the registry, not on the CLI**, so an arm is fully identified by its key and nothing about it has to be reconstructed later. To sweep a hyperparameter, add another key rather than another flag.
+
+Losses are objects with `__call__(logits, targets)` and an optional `on_epoch_start(epoch, total_epochs)`; `train_model` calls the hook once per epoch, which is what drives the boundary arm's weight ramp. `Compound` takes `(loss, weight)` pairs where a weight is either a constant or a `(start, end)` tuple ramped linearly across epochs.
+
+Arms: `ce`, `dice`, `dice_ce` (default), `dice_ce_legacy`, `tversky_ce`, `focal_tversky_ce`, `dice_ce_boundary`.
+
+`DiceLoss` differs from the upstream `utils/dice_score.dice_loss` in three ways that all matter:
+
+- **background excluded** — CE handles class 0; pooling it into Dice lets background agreement dominate the score.
+- **reduced per class, then averaged** — otherwise LV's pixel count swamps the atria.
+- **numerator/denominator aggregated over the batch** ("batch Dice", as nnU-Net does for 2D). With per-slice Dice an absent class scores `eps/eps ≈ 1.0` with no gradient, so a false positive on an empty slice costs almost nothing — and 33.5% of (slice, class) pairs here are empty.
+
+Measured on synthetic volumes, the corrected loss penalises a confident false positive on an empty class ~11× harder than the pooled version (0.167 vs 0.0156), and penalises dropping a small structure entirely ~64× harder (0.25 vs 0.0039). `dice_ce_legacy` reproduces the old pooled behaviour so pre-fix checkpoints stay interpretable; `utils/dice_score.py` itself is unchanged because `evaluate.py` still uses its coefficient.
+
+`BoundaryLoss` (Kervadec 2019) computes signed distance maps on CPU per batch via `scipy.ndimage.distance_transform_edt` — φ is in **pixels**, not mm. Classes absent from a slice get φ = 0, contributing nothing rather than an undefined distance. It has no region anchor and is unstable alone; only use it compounded, as `dice_ce_boundary` does.
 
 ## Class labels
 
@@ -79,12 +113,20 @@ This mapping was confirmed against the masks' own geometry, not assumed: inter-c
 
 Two separate paths, deliberately:
 
-- `evaluate.py` — slice-wise mean Dice, used as the in-training signal for the LR scheduler and checkpoint selection. **Not reportable.** `dice_coeff` scores a class that is absent from a slice as 1.0 (`eps/eps`), and 33.5% of (slice, class) pairs in this dataset are empty, so this number is inflated.
+- `evaluate.py` — slice-wise mean Dice, used as the in-training signal for the LR scheduler (only; checkpoint selection moved to `metrics.macro_dice`). **Not reportable.** `dice_coeff` scores a class that is absent from a slice as 1.0 (`eps/eps`), and 33.5% of (slice, class) pairs in this dataset are empty, so this number is inflated.
 - `utils/metrics.py` — per-patient, per-class, 3D metrics for anything you actually report. Dice is computed on whole volumes (all four structures appear in 100% of volumes, so the empty-class problem disappears), and HD95 is in **mm**, using the medpy/ACDC convention (95th percentile of pooled bidirectional surface distances) so it is comparable with published numbers.
 
-`metrics.report(net, dataset, indices, device, n_classes, out_dir=..., split_name=...)` scores a split and writes `<split>_metrics_per_patient.csv` (one row per patient × class) and `<split>_metrics_summary.csv` (mean/SD/median/IQR per class) into the run's checkpoint directory. `train_model` calls this automatically for val and test after training, using best-validation weights.
+`metrics.report(net, dataset, indices, device, n_classes, out_dir=..., split_name=...)` scores a split and writes `<split>_metrics_per_patient.csv` (one row per patient × class) and `<split>_metrics_summary.csv` (mean/SD/median/IQR per class) into the run's checkpoint directory. `train_model` calls this automatically after training, using best-validation weights: **val is always scored, test only when `eval_test=True`**. That asymmetry is what lets an ablation (`eval_test=False`) produce comparable CSVs without touching the test set.
 
-Three metrics per (patient, class): `dice`, `hd95_mm`, `assd_mm`. HD95 and ASSD come from `surface_metrics()`, which computes both from one shared pair of distance transforms; both follow medpy conventions (HD95 = 95th percentile of *pooled* bidirectional distances; ASSD = mean of the two *directional means* — these are different poolings, deliberately). The per-patient CSV also stores `gt_voxels`/`pred_voxels`/`voxel_ml`, which is what makes Bland–Altman volume agreement derivable without re-running the model.
+`metrics.macro_dice(net, dataset, indices, ...)` is the cheap variant used for per-epoch checkpoint selection — same per-patient volume Dice, but with `compute_hd95=False` so it skips the surface distances and the DICOM header read they need.
+
+Five metrics per (patient, class), listed in `metrics.DEFAULT_METRICS`: `dice`, `precision`, `recall`, `hd95_mm`, `assd_mm`.
+
+`precision`/`recall` are diagnostic, not endpoints. Dice is their harmonic mean, so it cannot separate over-segmentation from under-segmentation — low recall means the model is missing true voxels, low precision means it is claiming voxels it shouldn't. This is also the only direct readout of whether an asymmetric loss did what it was designed to do (`tversky_ce` uses β>α specifically to raise recall). nan conventions match `dice_binary`: recall is undefined with no ground truth, precision with no prediction — so a total miss gives recall 0.0 (real, counts) and precision nan. `compare_runs` deliberately does **not** include them by default: they would grow the Holm family from 12 tests to 20 and weaken the correction on the metrics being compared.
+
+`summarise()` and `format_summary()` silently drop metrics absent from the rows they're given, so CSVs written before a metric existed (the pre-ASSD, pre-precision/recall runs) still load instead of raising `KeyError`.
+
+HD95 and ASSD come from `surface_metrics()`, which computes both from one shared pair of distance transforms; both follow medpy conventions (HD95 = 95th percentile of *pooled* bidirectional distances; ASSD = mean of the two *directional means* — these are different poolings, deliberately). The per-patient CSV also stores `gt_voxels`/`pred_voxels`/`voxel_ml`, which is what makes Bland–Altman volume agreement derivable without re-running the model.
 
 The summary CSV has a macro row (`class_name == 'all_classes_macro'`, `cls == -1`) carrying `hd95_mm_*` and `assd_mm_*` like every other row; the per-patient CSV deliberately has no macro row.
 
@@ -100,7 +142,9 @@ Voxel spacing is **not uniform** across this dataset (0.6968 / 0.6944 / 0.6481 m
 
 ## Notebooks
 
-`unet_applied.ipynb`, `unet_applied_v2.ipynb`, `unet_applied_v3.ipynb` are iterative exploration/pipeline notebooks (v3 is the most recent). They're used for interactive experimentation alongside the `.py` scripts rather than as the canonical pipeline.
+`unet_applied.ipynb` is the iterative exploration/pipeline notebook, used for interactive experimentation alongside the `.py` scripts rather than as the canonical pipeline.
+
+`loss_ablation.ipynb` drives the loss ablation: arms × seeds in a resumable loop, seed-averaged per-patient CSVs, paired comparison against `dice_ce`, and a gated final test cell. It is deliberately validation-only (`eval_test=False` on every run) — choosing a loss is model selection, so scoring test during it would burn the held-out set. Its `SPLIT_SEED` must not be changed.
 
 ## Data layout
 

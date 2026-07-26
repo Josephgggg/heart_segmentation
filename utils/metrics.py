@@ -34,6 +34,34 @@ def dice_binary(pred: np.ndarray, gt: np.ndarray) -> float:
     return 2.0 * float(np.logical_and(pred, gt).sum()) / (pred_n + gt_n)
 
 
+def precision_recall(pred: np.ndarray, gt: np.ndarray) -> dict:
+    """Precision and recall for one binary volume pair.
+
+    Dice is the harmonic mean of these two, so it cannot distinguish
+    over-segmentation from under-segmentation: a model that floods a chamber and
+    one that starves it can score the same. Splitting them says which:
+
+        recall    low  -> under-segmenting, the model is missing true voxels
+        precision low  -> over-segmenting, the model is claiming voxels it shouldn't
+
+    That is also the direct readout of an asymmetric loss. `tversky_ce` weights
+    false negatives above false positives (beta > alpha) specifically to raise
+    recall, so without these two you can see that arm's Dice move but not whether
+    it moved for the intended reason.
+
+    nan conventions match dice_binary: recall is undefined with no ground truth,
+    precision is undefined with no prediction. Note that a total miss (ground
+    truth present, prediction empty) gives recall 0.0 and precision nan -- the
+    0.0 is real and should count, which is why they are handled separately.
+    """
+    gt_n, pred_n = int(gt.sum()), int(pred.sum())
+    tp = float(np.logical_and(pred, gt).sum())
+    return {
+        'precision': tp / pred_n if pred_n else float('nan'),
+        'recall': tp / gt_n if gt_n else float('nan'),
+    }
+
+
 def _surface(mask: np.ndarray) -> np.ndarray:
     footprint = generate_binary_structure(mask.ndim, 1)
     return mask ^ binary_erosion(mask, structure=footprint, iterations=1)
@@ -112,6 +140,7 @@ def assd(pred: np.ndarray, gt: np.ndarray, spacing) -> float:
 
 
 @torch.inference_mode()
+@torch.inference_mode()
 def predict_volume(net, dataset, patient_indices, device, amp=False, batch_size=8, num_workers=2):
     """Run the model over one patient's slices, in slice order, and stack to 3D."""
     ordered = sorted(patient_indices, key=lambda i: dataset.index[i][1])
@@ -132,11 +161,16 @@ def predict_volume(net, dataset, patient_indices, device, amp=False, batch_size=
 
 
 def evaluate_per_patient(net, dataset, indices, device, n_classes, amp=False,
-                         class_names=None, batch_size=8, compute_hd95=True):
+                         class_names=None, batch_size=8, compute_hd95=True, quiet=False):
     """Score every patient covered by `indices`, one row per (patient, class).
 
     Returns a list of dicts: patient_id, cls, class_name, dice, hd95_mm,
     gt_voxels, pred_voxels, missed (prediction empty while ground truth is not).
+
+    `compute_hd95=False` skips the surface distances (and the DICOM header read
+    they need), leaving just Dice -- that is the cheap path used for per-epoch
+    checkpoint selection. `quiet` suppresses the per-patient progress line, which
+    is noise when this runs every epoch.
     """
     by_patient = defaultdict(list)
     for i in indices:
@@ -145,30 +179,59 @@ def evaluate_per_patient(net, dataset, indices, device, n_classes, amp=False,
     rows = []
     for n, (patient_id, idxs) in enumerate(sorted(by_patient.items()), start=1):
         pred_vol, gt_vol = predict_volume(net, dataset, idxs, device, amp=amp, batch_size=batch_size)
-        spacing = dataset.spacing_for(patient_id)
-        logging.info(f'  [{n}/{len(by_patient)}] {patient_id}: {pred_vol.shape[0]} slices, '
-                     f'spacing {tuple(round(s, 4) for s in spacing)} mm')
+        spacing = dataset.spacing_for(patient_id) if compute_hd95 else None
+        if not quiet:
+            logging.info(f'  [{n}/{len(by_patient)}] {patient_id}: {pred_vol.shape[0]} slices, '
+                         f'spacing {tuple(round(s, 4) for s in spacing)} mm')
 
         for cls in range(1, n_classes):       # class 0 is background
             pred_c, gt_c = pred_vol == cls, gt_vol == cls
             surf = (surface_metrics(pred_c, gt_c, spacing) if compute_hd95
                     else {'hd95_mm': float('nan'), 'assd_mm': float('nan')})
+            pr = precision_recall(pred_c, gt_c)
             rows.append({
                 'patient_id': patient_id,
                 'cls': cls,
                 'class_name': (class_names or {}).get(cls, f'class_{cls}'),
                 'dice': dice_binary(pred_c, gt_c),
+                'precision': pr['precision'],
+                'recall': pr['recall'],
                 'hd95_mm': surf['hd95_mm'],
                 'assd_mm': surf['assd_mm'],
                 'gt_voxels': int(gt_c.sum()),
                 'pred_voxels': int(pred_c.sum()),
-                'voxel_ml': float(np.prod(spacing)) / 1000.0,   # for volume agreement
+                # for volume agreement; needs spacing, so nan on the cheap path
+                'voxel_ml': float(np.prod(spacing)) / 1000.0 if spacing is not None else float('nan'),
                 'missed': bool(gt_c.any() and not pred_c.any()),
             })
     return rows
 
 
-def summarise(rows, metrics=('dice', 'hd95_mm', 'assd_mm')):
+def macro_dice(net, dataset, indices, device, n_classes, amp=False, batch_size=8):
+    """Per-patient, per-class Dice on whole volumes, averaged to one number.
+
+    This is the checkpoint-selection signal. `evaluate.py`'s slice-wise Dice is
+    unusable for that in a loss ablation: it scores a class absent from a slice
+    as 1.0, so it rewards a model for predicting nothing on empty slices -- and
+    how a loss treats empty classes is exactly what the arms differ in. Selecting
+    on it would fold that bias into the comparison.
+
+    Each patient is reduced to a mean over the foreground classes first, then
+    averaged over patients, so a patient counts once regardless of slice count.
+    """
+    rows = evaluate_per_patient(net, dataset, indices, device, n_classes, amp=amp,
+                                batch_size=batch_size, compute_hd95=False, quiet=True)
+    per_patient = defaultdict(list)
+    for r in rows:
+        per_patient[r['patient_id']].append(r['dice'])
+    means = [np.nanmean(v) for v in per_patient.values() if not np.all(np.isnan(v))]
+    return float(np.mean(means)) if means else float('nan')
+
+
+DEFAULT_METRICS = ('dice', 'precision', 'recall', 'hd95_mm', 'assd_mm')
+
+
+def summarise(rows, metrics=DEFAULT_METRICS):
     """Mean / SD / median / IQR across PATIENTS, per class, plus an all-class row.
 
     n is the number of patients actually contributing (nan values are excluded),
@@ -176,8 +239,12 @@ def summarise(rows, metrics=('dice', 'hd95_mm', 'assd_mm')):
     patients where the structure exists but the model predicted nothing for it --
     those have no defined HD95 and would otherwise vanish from the mean, making
     the model look better the more badly it fails.
+
+    Metrics absent from `rows` are dropped rather than raising, so CSVs written
+    before a metric existed (the pre-ASSD, pre-precision/recall runs) still load.
     """
     out = []
+    metrics = tuple(m for m in metrics if rows and m in rows[0])
     by_class = defaultdict(list)
     for r in rows:
         by_class[(r['cls'], r['class_name'])].append(r)
@@ -218,12 +285,14 @@ def summarise(rows, metrics=('dice', 'hd95_mm', 'assd_mm')):
     return out
 
 
-def format_summary(summary, metrics=('dice', 'hd95_mm', 'assd_mm')):
+def format_summary(summary, metrics=DEFAULT_METRICS):
     """Human-readable 'mean +/- SD' table, ready to paste into notes or a paper."""
+    metrics = tuple(m for m in metrics if summary and f'{m}_n' in summary[0])
+
     def cell(m, r):
         if not r[f'{m}_n']:
             return f'{"n/a":>21}'
-        dp = 4 if m == 'dice' else 2
+        dp = 4 if m in ('dice', 'precision', 'recall') else 2
         return f'{r[f"{m}_mean"]:>10.{dp}f} +/- {r[f"{m}_sd"]:<8.{dp}f}'
 
     lines = [f'{"class":<20}{"n":>4}{"missed":>8}' + ''.join(f'{m:>21}' for m in metrics)]
@@ -238,7 +307,7 @@ def load_per_patient(path):
     rows = []
     with open(path) as f:
         for r in csv.DictReader(f):
-            for k in ('dice', 'hd95_mm', 'assd_mm', 'voxel_ml'):
+            for k in ('dice', 'precision', 'recall', 'hd95_mm', 'assd_mm', 'voxel_ml'):
                 if k in r:
                     r[k] = float(r[k]) if r[k] not in ('', 'nan') else float('nan')
             for k in ('cls', 'gt_voxels', 'pred_voxels'):
@@ -261,6 +330,11 @@ def _holm(pvals):
 
 
 def compare_runs(path_a, path_b, label_a='A', label_b='B',
+                 # deliberately NOT DEFAULT_METRICS: precision and recall are
+                 # diagnostics for reading a single run, not endpoints. Adding
+                 # them would grow the Holm family from 12 tests to 20 and weaken
+                 # the correction on the metrics you actually want to compare.
+                 # Pass them explicitly if you specifically want to test them.
                  metrics=('dice', 'hd95_mm', 'assd_mm')):
     """Paired Wilcoxon signed-rank comparison of two runs scored on the SAME patients.
 
@@ -339,16 +413,19 @@ def compare_runs(path_a, path_b, label_a='A', label_b='B',
 def format_comparison(comparison, label_a='A', label_b='B'):
     """Readable paired-comparison table. '*' marks the pre-specified primary endpoint."""
     ka, kb = f'median_{label_a}', f'median_{label_b}'
-    lines = [f'{"class":<20}{"metric":<10}{"n":>3}{label_a:>12}{label_b:>12}'
+    # widen the two median columns to fit the labels -- loss-arm names like
+    # "dice_ce_boundary" overflow a fixed 12 and run into the next header
+    w = max(12, len(label_a) + 2, len(label_b) + 2)
+    lines = [f'{"class":<20}{"metric":<10}{"n":>3}{label_a:>{w}}{label_b:>{w}}'
              f'{"diff":>10}{"p":>10}{"p_holm":>10}',
-             f'{"-" * 87}']
+             f'{"-" * (63 + 2 * w)}']
     for r in comparison:
         dp = 4 if r['metric'] == 'dice' else 2
         ph = f'{r["p_holm"]:.4f}' if not np.isnan(r['p_holm']) else ('primary' if r['primary'] else '-')
         pv = f'{r["p_value"]:.4f}' if not np.isnan(r['p_value']) else 'n/a'
         star = '*' if r['primary'] else ' '
         lines.append(f'{star + r["class_name"]:<20}{r["metric"]:<10}{r["n_pairs"]:>3}'
-                     f'{r[ka]:>12.{dp}f}{r[kb]:>12.{dp}f}{r["median_diff"]:>+10.{dp}f}'
+                     f'{r[ka]:>{w}.{dp}f}{r[kb]:>{w}.{dp}f}{r["median_diff"]:>+10.{dp}f}'
                      f'{pv:>10}{ph:>10}')
     return '\n'.join(lines)
 
