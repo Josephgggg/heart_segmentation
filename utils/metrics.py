@@ -22,6 +22,7 @@ import logging
 import numpy as np
 import torch
 from collections import defaultdict
+from pathlib import Path
 from scipy.ndimage import binary_erosion, distance_transform_edt, generate_binary_structure
 from torch.utils.data import DataLoader, Subset
 
@@ -454,3 +455,82 @@ def report(net, dataset, indices, device, n_classes, out_dir=None, split_name='t
         write_csv(rows, out_dir / f'{split_name}_metrics_per_patient.csv')
         write_csv(summary, out_dir / f'{split_name}_metrics_summary.csv')
     return rows, summary
+
+
+def _plot_overlay(img, gt, pred, n_classes, class_names, title, path):
+    """Save one PNG: input image with GT and predicted masks overlaid side by side."""
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import ListedColormap
+    from matplotlib.patches import Patch
+
+    colors = ['none', 'tab:red', 'tab:green', 'tab:blue', 'tab:orange']
+    cmap = ListedColormap(colors[:n_classes])
+    class_names = class_names or {}
+
+    fig, axes = plt.subplots(1, 2, figsize=(9, 4.5))
+    for ax, mask, label in zip(axes, (gt, pred), ('ground truth', 'prediction')):
+        ax.imshow(img, cmap='gray')
+        ax.imshow(np.ma.masked_equal(mask, 0), cmap=cmap, vmin=0, vmax=n_classes - 1, alpha=0.5)
+        ax.set_title(label)
+        ax.axis('off')
+
+    handles = [Patch(color=colors[c], label=class_names.get(c, f'class_{c}')) for c in range(1, n_classes)]
+    fig.legend(handles=handles, loc='lower center', ncol=len(handles), frameon=False)
+    fig.suptitle(title)
+    fig.tight_layout(rect=(0, 0.06, 1, 1))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
+def save_best_worst_slices(net, dataset, indices, device, n_classes, out_dir,
+                            class_names=None, amp=False, batch_size=8, split_name='val'):
+    """Find and plot the best- and worst-scoring slices in a split, for one model.
+
+    Per-slice score is the mean Dice over foreground classes present in that
+    slice's ground truth. Slices with no foreground class are skipped entirely --
+    otherwise an empty slice trivially scores 1.0 (`dice_binary`'s eps/eps case,
+    same inflation `evaluate.py` has at the volume level) and would dominate
+    "best" with a meaningless result.
+
+    Saves `<split_name>_best_slice.png` / `<split_name>_worst_slice.png` under
+    `out_dir` (the run's checkpoint directory) and returns their paths, or None
+    if the split has no slice with any foreground.
+    """
+    by_patient = defaultdict(list)
+    for i in indices:
+        by_patient[dataset.index[i][0]].append(i)
+
+    best = worst = None   # (score, patient_id, slice_idx, global_idx, pred_slice, gt_slice)
+    for patient_id, idxs in sorted(by_patient.items()):
+        ordered = sorted(idxs, key=lambda i: dataset.index[i][1])
+        pred_vol, gt_vol = predict_volume(net, dataset, idxs, device, amp=amp, batch_size=batch_size)
+        for pos, global_idx in enumerate(ordered):
+            gt_slice, pred_slice = gt_vol[pos], pred_vol[pos]
+            class_scores = [dice_binary(pred_slice == c, gt_slice == c) for c in range(1, n_classes)]
+            class_scores = [s for s in class_scores if not np.isnan(s)]
+            if not class_scores:
+                continue   # no foreground in this slice's ground truth -- trivial, skip
+            score = float(np.mean(class_scores))
+            entry = (score, patient_id, dataset.index[global_idx][1], global_idx, pred_slice, gt_slice)
+            if best is None or score > best[0]:
+                best = entry
+            if worst is None or score < worst[0]:
+                worst = entry
+
+    if best is None:
+        logging.warning(f'{split_name}: no slice with foreground found, skipping best/worst slice plots')
+        return None
+
+    out_dir = Path(out_dir)
+    paths = {}
+    for tag, entry in (('best', best), ('worst', worst)):
+        score, patient_id, slice_idx, global_idx, pred_slice, gt_slice = entry
+        img = dataset[global_idx]['image'].numpy()[0]
+        path = out_dir / f'{split_name}_{tag}_slice.png'
+        _plot_overlay(img, gt_slice, pred_slice, n_classes, class_names,
+                      title=f'{tag} {split_name} slice — {patient_id} #{slice_idx} (Dice={score:.3f})',
+                      path=path)
+        logging.info(f'{split_name} {tag} slice: {patient_id} #{slice_idx}, Dice={score:.3f} -> {path}')
+        paths[tag] = path
+    return paths

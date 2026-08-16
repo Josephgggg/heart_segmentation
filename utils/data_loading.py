@@ -128,12 +128,20 @@ class BasicDataset(Dataset):
 #         super().__init__(images_dir, mask_dir, scale, mask_suffix='_mask')
 
 class VolumeMRIDataset(Dataset):
-    def __init__(self, images_dir, mask_dir, scale: float = 1.0, cache_size: int = 4700, disk_cache_dir=None):
+    def __init__(self, images_dir, mask_dir, scale: float = 1.0, cache_size: int = 4700, disk_cache_dir=None,
+                 phase: str = 'water'):
+        if phase not in ('water', 'fat'):
+            raise ValueError(f"phase must be 'water' or 'fat', got {phase!r}")
         self.images_dir = Path(images_dir)
         self.mask_dir = Path(mask_dir)
         self.scale = scale
         self.cache_size = cache_size
-        
+        # Each patient's .dcm holds both phases back to back: the first half of
+        # slices is the water acquisition, the second half is fat, both sharing
+        # the same NIfTI mask geometry. 'phase' picks which half of the volume
+        # gets loaded and which mask label survives (see _read_and_process_volume).
+        self.phase = phase
+
         # processed volumes get saved/loaded on disk
         self.disk_cache_dir = Path(disk_cache_dir) if disk_cache_dir else self.images_dir.parent / 'preprocessed_cache'
         self.disk_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -172,12 +180,17 @@ class VolumeMRIDataset(Dataset):
         #    _, mask_vol = self._get_volume(patient_id)   # uses disk cache if available
         #    all_values.update(np.unique(mask_vol).tolist())
         #self.mask_values = sorted(all_values)
-        self.mask_values = [0.0, 1.0, 2.0, 3.0, 4.0]
+        # water keeps the 4 chambers (label 5/EAT falls through to background);
+        # fat keeps only EAT (labels 1-4 fall through to background instead).
+        self.mask_values = [0.0, 1.0, 2.0, 3.0, 4.0] if phase == 'water' else [0.0, 5.0]
         logging.info(f'Unique mask values: {self.mask_values}')
 
     def _disk_cache_paths(self, patient_id):
-        return (self.disk_cache_dir / f'{patient_id}_img.npy',
-                self.disk_cache_dir / f'{patient_id}_mask.npy')
+        # water keeps the original unsuffixed filenames so pre-existing caches stay
+        # valid; only fat (the new phase) gets a suffix, so the two never collide.
+        suffix = '' if self.phase == 'water' else f'_{self.phase}'
+        return (self.disk_cache_dir / f'{patient_id}{suffix}_img.npy',
+                self.disk_cache_dir / f'{patient_id}{suffix}_mask.npy')
 
     def spacing_for(self, patient_id):
         """Voxel spacing in mm as (slice, row, col), accounting for self.scale.
@@ -220,16 +233,24 @@ class VolumeMRIDataset(Dataset):
         if img_vol.ndim == 2:
             img_vol = img_vol[np.newaxis, ...]
 
+        # Each volume is water slices followed by fat slices. Anchor the fat half
+        # at the END rather than slicing from the midpoint, so both phases yield
+        # exactly `half` slices even when n_total is odd (midpoint slicing would
+        # give the fat half one extra slice and desync it from the mask/index
+        # count computed in __init__).
         n_total = img_vol.shape[0]
-        img_vol = img_vol[:n_total // 2]
+        half = n_total // 2
+        img_vol = img_vol[:half] if self.phase == 'water' else img_vol[n_total - half:]
 
         mask_vol = nib.load(self.mask_file_for[patient_id]).get_fdata()
         mask_vol = np.transpose(mask_vol, (2, 0, 1))
         mask_vol = np.rot90(mask_vol[:, :, ::-1], k=1, axes=(1, 2)).astype(np.float32)
 
-        # removing fat label
         FAT_LABEL = 5.0
-        mask_vol[mask_vol == FAT_LABEL] = 0.0   # relabel fat as background
+        if self.phase == 'water':
+            mask_vol[mask_vol == FAT_LABEL] = 0.0   # drop EAT, keep the 4 chambers
+        else:
+            mask_vol[mask_vol != FAT_LABEL] = 0.0   # drop the chambers, keep only EAT
 
         assert img_vol.shape[0] == mask_vol.shape[0], \
             f'{patient_id}: {img_vol.shape[0]} image slices vs {mask_vol.shape[0]} mask slices — mismatch'

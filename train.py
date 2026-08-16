@@ -34,9 +34,18 @@ dir_img = Path('./data/imgs/')
 dir_mask = Path('./data/masks/')
 dir_checkpoint = Path('./checkpoints/')
 
-# Cardiac chamber labels in the NIfTI masks. 0 = background; label 5 (fat) is
-# relabelled to background by VolumeMRIDataset.
+# Cardiac chamber labels in the NIfTI masks. 0 = background. VolumeMRIDataset
+# loads one of two phases from the same .dcm/.nii pair: 'water' keeps the 4
+# chambers (label 5/EAT relabelled to background), 'fat' keeps only EAT (labels
+# 1-4 relabelled to background instead) -- see its `phase` argument.
 CLASS_NAMES = {1: 'LV', 2: 'RV', 3: 'LA', 4: 'RA'}
+PHASE_CLASS_NAMES = {
+    'water': CLASS_NAMES,
+    'fat': {1: 'EAT'},
+}
+# Model output channels (incl. background) appropriate for each phase, used as
+# the --classes default when the user doesn't override it.
+PHASE_N_CLASSES = {'water': 5, 'fat': 2}
 
 
 class PatientGroupedSampler(Sampler):
@@ -109,9 +118,9 @@ def seed_worker(worker_id):
     random.seed(worker_seed)
 
 
-def build_dataset(img_scale: float = 0.5):
+def build_dataset(img_scale: float = 0.5, phase: str = 'water'):
     try:
-        return VolumeMRIDataset(dir_img, dir_mask, img_scale)
+        return VolumeMRIDataset(dir_img, dir_mask, img_scale, phase=phase)
     except (AssertionError, RuntimeError, IndexError):
         return BasicDataset(dir_img, dir_mask, img_scale)
 
@@ -186,6 +195,8 @@ def train_model(
         deterministic: bool = False,
         loss: str = 'dice_ce',
         select_on: str = 'macro_dice',
+        lr_schedule: str = 'poly',
+        phase: str = 'water',
 ):
     # 0. Reseed. NOTE: the caller built the model, so its weights were already
     # drawn -- call set_seed() before UNet(...) too for a bit-comparable run.
@@ -197,7 +208,7 @@ def train_model(
 
     # 1. Create dataset
     if dataset is None:
-        dataset = build_dataset(img_scale)
+        dataset = build_dataset(img_scale, phase=phase)
 
     # 2. Split into train / validation / test partitions, by patient
     train_idx, val_idx, test_idx = split_patients(
@@ -228,6 +239,14 @@ def train_model(
 
     if run_name is None:
         run_name = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    # water keeps unprefixed run names -- every existing checkpoint directory and
+    # every notebook's already_done()/run_dir bookkeeping (loss_ablation.ipynb,
+    # unet_applied.ipynb) was computed against these names before `phase` existed,
+    # and those callers build run_dir themselves from the SAME string they pass in
+    # here, so silently renaming it out from under them would desync the two and
+    # make every finished run look unfinished. fat is new, so it gets the prefix.
+    if phase != 'water':
+        run_name = f'{phase}_{run_name}'
     run_checkpoint_dir = Path(dir_checkpoint) / run_name
 
     # Record exactly what produced this run, next to its metrics. Without this,
@@ -238,9 +257,13 @@ def train_model(
         'epochs': epochs, 'batch_size': batch_size, 'learning_rate': learning_rate,
         'weight_decay': weight_decay, 'momentum': momentum,
         'gradient_clipping': gradient_clipping,
-        'optimizer': 'RMSprop', 'scheduler': 'ReduceLROnPlateau(max, patience=5)',
+        'optimizer': 'RMSprop', 'lr_schedule': lr_schedule,
+        'scheduler': {'poly': 'LambdaLR poly (1-e/E)**0.9, per epoch',
+                      'cosine': 'CosineAnnealingLR, per epoch',
+                      'plateau': 'ReduceLROnPlateau(max, patience=5), per epoch',
+                      'constant': 'none'}[lr_schedule],
         'img_scale': img_scale, 'amp': amp, 'augment': augment,
-        'loss': loss_label, 'select_on': select_on,
+        'loss': loss_label, 'select_on': select_on, 'phase': phase,
         'n_classes': model.n_classes, 'n_channels': model.n_channels,
         'bilinear': model.bilinear,
         'val_percent': val_percent, 'test_percent': test_percent, 'split_seed': split_seed,
@@ -260,13 +283,14 @@ def train_model(
     experiment = wandb.init(
         project='cardiac-mri-segmentation',
         name=run_name,
+        tags=[phase],
         reinit=True,
     )
     experiment.config.update(
         dict(epochs=epochs, batch_size=batch_size, learning_rate=learning_rate,
              val_percent=val_percent, test_percent=test_percent, split_seed=split_seed,
              save_checkpoint=save_checkpoint, img_scale=img_scale, amp=amp, augment=augment,
-             loss=loss_label, select_on=select_on,
+             loss=loss_label, select_on=select_on, lr_schedule=lr_schedule, phase=phase,
              n_train=n_train, n_val=n_val, n_test=n_test)
     )
 
@@ -279,6 +303,7 @@ def train_model(
         Test size:       {n_test} (held out, {'scored once after training' if eval_test else 'not scored'})
         Augmentation:    {augment}
         Loss:            {loss_label}
+        LR schedule:     {lr_schedule}
         Select best on:  {select_on}
         Checkpoints:     {save_checkpoint}
         Device:          {device.type}
@@ -289,7 +314,32 @@ def train_model(
     # 4. Set up the optimizer, the loss, the learning rate scheduler and the loss scaling for AMP
     optimizer = optim.RMSprop(model.parameters(),
                               lr=learning_rate, weight_decay=weight_decay, momentum=momentum, foreach=True)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=5)  # goal: maximize Dice score
+
+    # LR schedule. 'poly' is nnU-Net's rule, lr0 * (1 - epoch/epochs)**0.9, stepped
+    # once per epoch and depending on nothing but the epoch number.
+    #
+    # That last property is the reason it is the default here. ReduceLROnPlateau
+    # fires off the validation curve, and the validation curve depends on the loss
+    # being trained -- so in an ablation each arm would get its own LR trajectory
+    # and "which loss is better" could not be separated from "which loss delayed
+    # its LR drops". A deterministic schedule gives every arm the same trajectory.
+    #
+    # 'plateau' keeps the old behaviour available, but note it was stepped inside
+    # the mid-epoch block (~5x/epoch), which made patience=5 mean roughly ONE
+    # stagnant epoch; with factor=0.1 the LR fell 100x within 5 epochs and
+    # training stopped by ~epoch 8. If you use it, step it once per epoch.
+    if lr_schedule == 'poly':
+        scheduler = optim.lr_scheduler.LambdaLR(
+            optimizer, lambda e: (1 - e / max(1, epochs)) ** 0.9)
+    elif lr_schedule == 'cosine':
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    elif lr_schedule == 'plateau':
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=5)
+    elif lr_schedule == 'constant':
+        scheduler = None
+    else:
+        raise ValueError(f'Unknown lr_schedule {lr_schedule!r}: '
+                         "expected 'poly', 'cosine', 'plateau' or 'constant'")
     grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
     # One ablation arm, resolved from its registry name (see utils/losses.py).
     criterion = build_loss(loss, model.n_classes)
@@ -399,9 +449,10 @@ def train_model(
                             if not (torch.isinf(value.grad) | torch.isnan(value.grad)).any():
                                 histograms['Gradients/' + tag] = wandb.Histogram(value.grad.data.cpu())
 
+                        # NOTE: scheduler.step() used to live here, so it ran ~5x
+                        # per epoch and patience=5 meant one stagnant epoch. The
+                        # step is now once per epoch, at the end of the loop below.
                         val_score = evaluate(model, val_loader, device, amp)
-                        scheduler.step(val_score)
-
 
                         logging.info('Validation Dice score: {}'.format(val_score))
                         try:
@@ -443,20 +494,34 @@ def train_model(
         if not np.isfinite(selection_score):        # no val patients, or the cheap path failed
             selection_score = epoch_val_dice
 
-        logging.info(f'Epoch {epoch}: mean train loss = {mean_epoch_loss:.4f}, '
+        # LR is recorded BEFORE stepping, so history[i]['lr'] is the rate that
+        # actually trained epoch i. Logging this per epoch is what makes an LR
+        # collapse visible in run_config.json instead of only as a flat loss curve.
+        epoch_lr = optimizer.param_groups[0]['lr']
+
+        logging.info(f'Epoch {epoch}: lr = {epoch_lr:.3e}, mean train loss = {mean_epoch_loss:.4f}, '
                      f'val Dice (slice) = {epoch_val_dice:.4f}, '
                      f'val Dice (per-patient macro) = {epoch_val_macro_dice:.4f}')
 
-        history.append({'epoch': epoch, 'train_loss': mean_epoch_loss,
+        history.append({'epoch': epoch, 'lr': epoch_lr, 'train_loss': mean_epoch_loss,
                         'val_dice': epoch_val_dice,
                         'val_macro_dice': epoch_val_macro_dice})
 
         experiment.log({
             'epoch': epoch,
+            'learning rate': epoch_lr,
             'epoch_train_loss': mean_epoch_loss,
             'epoch_val_dice': epoch_val_dice,
             'epoch_val_macro_dice': epoch_val_macro_dice,
         })
+
+        # Step ONCE per epoch. 'plateau' needs the metric; the deterministic
+        # schedules depend only on the epoch count.
+        if scheduler is not None:
+            if lr_schedule == 'plateau':
+                scheduler.step(selection_score)
+            else:
+                scheduler.step()
 
         is_best = selection_score > best_selection_score
         if is_best:
@@ -509,7 +574,7 @@ def train_model(
             rows, summary = metrics.report(
                 model, dataset, split_idx, device, n_classes=model.n_classes,
                 out_dir=run_checkpoint_dir, split_name=split_name, amp=amp,
-                class_names=CLASS_NAMES if class_names is None else class_names,
+                class_names=PHASE_CLASS_NAMES[phase] if class_names is None else class_names,
                 batch_size=batch_size,
             )
             per_patient_results[split_name] = {'rows': rows, 'summary': summary}
@@ -518,6 +583,15 @@ def train_model(
                 experiment.summary[f'{split_name}/{r["class_name"]}/dice_sd'] = r['dice_sd']
                 experiment.summary[f'{split_name}/{r["class_name"]}/hd95_mean'] = r['hd95_mm_mean']
                 experiment.summary[f'{split_name}/{r["class_name"]}/hd95_sd'] = r['hd95_mm_sd']
+
+            # Best/worst-scoring slice, GT vs. prediction overlaid, for a quick visual
+            # sanity check of the best-validation model -- saved next to the checkpoints.
+            metrics.save_best_worst_slices(
+                model, dataset, split_idx, device, n_classes=model.n_classes,
+                out_dir=run_checkpoint_dir, split_name=split_name, amp=amp,
+                class_names=PHASE_CLASS_NAMES[phase] if class_names is None else class_names,
+                batch_size=batch_size,
+            )
 
     experiment.summary['best_val_dice'] = best_val_dice
     experiment.summary['best_val_macro_dice'] = best_val_macro_dice
@@ -540,6 +614,7 @@ def train_model(
         'run_name': run_name,
         'checkpoint_dir': run_checkpoint_dir,
         'loss': loss_label,
+        'lr_schedule': lr_schedule,
         'best_val_dice': best_val_dice,
         'best_val_macro_dice': best_val_macro_dice,
         'best_epoch': best_epoch,
@@ -569,7 +644,12 @@ def get_args():
                         help='Percent of the patients held out as test (0-100)')
     parser.add_argument('--amp', action='store_true', default=False, help='Use mixed precision')
     parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
-    parser.add_argument('--classes', '-c', type=int, default=2, help='Number of classes')
+    parser.add_argument('--phase', type=str, default='water', choices=['water', 'fat'],
+                        help='Which half of the DICOM volume / which mask labels to train on: '
+                             '"water" keeps the 4 chambers (default), "fat" keeps only EAT')
+    parser.add_argument('--classes', '-c', type=int, default=None,
+                        help='Number of classes (output channels, incl. background). '
+                             'Defaults to 5 for --phase water, 2 for --phase fat')
     parser.add_argument('--augment', action='store_true', default=False,
                         help='Apply data augmentation to the training split')
     parser.add_argument('--run-name', dest='run_name', type=str, default=None,
@@ -588,6 +668,11 @@ def get_args():
                         help='Loss function / ablation arm (see utils/losses.py). '
                              '"dice_ce" is the corrected per-class batch Dice + CE; '
                              '"dice_ce_legacy" reproduces the pre-fix pooled Dice')
+    parser.add_argument('--lr-schedule', dest='lr_schedule', type=str, default='poly',
+                        choices=['poly', 'cosine', 'plateau', 'constant'],
+                        help='LR schedule, stepped once per epoch. "poly" is nnU-Net\'s '
+                             'rule and is deterministic, so every arm of an ablation gets '
+                             'an identical LR trajectory')
     parser.add_argument('--select-on', dest='select_on', type=str, default='macro_dice',
                         choices=['macro_dice', 'slice_dice'],
                         help='Metric used to pick best.pth. Keep this identical across '
@@ -606,6 +691,9 @@ if __name__ == '__main__':
     # seed BEFORE building the model -- UNet(...) draws its initial weights from
     # the torch RNG, so seeding afterwards would leave the init random
     set_seed(args.seed, args.deterministic)
+
+    if args.classes is None:
+        args.classes = PHASE_N_CLASSES[args.phase]
 
     # Change here to adapt to your data
     # n_channels=3 for RGB images
@@ -642,6 +730,8 @@ if __name__ == '__main__':
         deterministic=args.deterministic,
         loss=args.loss,
         select_on=args.select_on,
+        lr_schedule=args.lr_schedule,
+        phase=args.phase,
     )
     try:
         train_model(model=model, **train_kwargs)
