@@ -1,4 +1,5 @@
 import logging
+import os
 import numpy as np
 import torch
 from PIL import Image
@@ -39,6 +40,26 @@ def load_image(filename):
         return torch.load(filename).numpy()
     else:
         return np.asarray(Image.open(filename))
+
+
+def _atomic_npy_save(path, arr):
+    """np.save(path, arr), but via a per-process temp file + os.replace.
+
+    Multiple processes can end up racing to populate the same disk cache
+    entry (e.g. two notebooks sharing preprocessed_cache/ while it's still
+    partially warm). A plain np.save(path, ...) is not atomic -- a reader
+    can observe a partially-written file mid-save. Writing to a uniquely
+    named temp file in the same directory and renaming into place sidesteps
+    that: os.replace is atomic on the same filesystem, so any reader either
+    sees the old complete file or the new complete file, never a torn one.
+    Redundant work from the race is still possible (last writer wins), just
+    not corruption.
+    """
+    path = Path(path)
+    tmp_path = path.with_name(f'{path.name}.tmp{os.getpid()}')
+    with open(tmp_path, 'wb') as f:
+        np.save(f, arr)
+    os.replace(tmp_path, path)
 
 
 def unique_mask_values(idx, mask_dir, mask_suffix):
@@ -128,10 +149,19 @@ class BasicDataset(Dataset):
 #         super().__init__(images_dir, mask_dir, scale, mask_suffix='_mask')
 
 class VolumeMRIDataset(Dataset):
+    # water keeps the 4 chambers (label 5/EAT falls through to background);
+    # fat keeps only EAT (labels 1-4 fall through to background instead);
+    # both stacks water+fat as 2 channels and keeps every label (0-5) intact.
+    PHASE_MASK_VALUES = {
+        'water': [0.0, 1.0, 2.0, 3.0, 4.0],
+        'fat':   [0.0, 5.0],
+        'both':  [0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+    }
+
     def __init__(self, images_dir, mask_dir, scale: float = 1.0, cache_size: int = 4700, disk_cache_dir=None,
                  phase: str = 'water'):
-        if phase not in ('water', 'fat'):
-            raise ValueError(f"phase must be 'water' or 'fat', got {phase!r}")
+        if phase not in self.PHASE_MASK_VALUES:
+            raise ValueError(f"phase must be one of {sorted(self.PHASE_MASK_VALUES)}, got {phase!r}")
         self.images_dir = Path(images_dir)
         self.mask_dir = Path(mask_dir)
         self.scale = scale
@@ -180,9 +210,7 @@ class VolumeMRIDataset(Dataset):
         #    _, mask_vol = self._get_volume(patient_id)   # uses disk cache if available
         #    all_values.update(np.unique(mask_vol).tolist())
         #self.mask_values = sorted(all_values)
-        # water keeps the 4 chambers (label 5/EAT falls through to background);
-        # fat keeps only EAT (labels 1-4 fall through to background instead).
-        self.mask_values = [0.0, 1.0, 2.0, 3.0, 4.0] if phase == 'water' else [0.0, 5.0]
+        self.mask_values = self.PHASE_MASK_VALUES[phase]
         logging.info(f'Unique mask values: {self.mask_values}')
 
     def _disk_cache_paths(self, patient_id):
@@ -240,7 +268,13 @@ class VolumeMRIDataset(Dataset):
         # count computed in __init__).
         n_total = img_vol.shape[0]
         half = n_total // 2
-        img_vol = img_vol[:half] if self.phase == 'water' else img_vol[n_total - half:]
+        water_vol, fat_vol = img_vol[:half], img_vol[n_total - half:]
+        if self.phase == 'water':
+            img_vol = water_vol
+        elif self.phase == 'fat':
+            img_vol = fat_vol
+        else:  # 'both' -- (half, 2, H, W): channel 0 = water, channel 1 = fat
+            img_vol = np.stack([water_vol, fat_vol], axis=1)
 
         mask_vol = nib.load(self.mask_file_for[patient_id]).get_fdata()
         mask_vol = np.transpose(mask_vol, (2, 0, 1))
@@ -249,16 +283,20 @@ class VolumeMRIDataset(Dataset):
         FAT_LABEL = 5.0
         if self.phase == 'water':
             mask_vol[mask_vol == FAT_LABEL] = 0.0   # drop EAT, keep the 4 chambers
-        else:
+        elif self.phase == 'fat':
             mask_vol[mask_vol != FAT_LABEL] = 0.0   # drop the chambers, keep only EAT
+        # 'both': mask_vol already carries labels 0-5 from the NIfTI as-is -- no relabelling needed
 
         assert img_vol.shape[0] == mask_vol.shape[0], \
             f'{patient_id}: {img_vol.shape[0]} image slices vs {mask_vol.shape[0]} mask slices — mismatch'
 
-        # NEW: save the result to disk so future runs skip all of the above
+        # NEW: save the result to disk so future runs skip all of the above.
+        # Atomic (temp file + rename) -- see _atomic_npy_save -- since another
+        # process (e.g. a second notebook sharing this cache) may be writing
+        # the same patient concurrently.
         logging.info(f'Preprocessing {patient_id} for the first time, saving to disk cache...')
-        np.save(img_cache_path, img_vol)
-        np.save(mask_cache_path, mask_vol)
+        _atomic_npy_save(img_cache_path, img_vol)
+        _atomic_npy_save(mask_cache_path, mask_vol)
 
         return img_vol, mask_vol
     
@@ -282,7 +320,17 @@ class VolumeMRIDataset(Dataset):
         img_vol, mask_vol = self._get_volume(patient_id)   # uses the cache now
         img, mask = img_vol[slice_idx], mask_vol[slice_idx]
 
-        img = BasicDataset.preprocess(self.mask_values, img, self.scale, is_mask=False)
+        if self.phase == 'both':
+            # img is (2, H, W): water, fat. Normalize each channel independently --
+            # preprocess() computes its 0.5/99.5 percentile clip over whatever 2D
+            # array it's given, so combining channels before clipping would let one
+            # channel's brightness distribution skew the other's normalization.
+            img = np.concatenate([
+                BasicDataset.preprocess(self.mask_values, img[0], self.scale, is_mask=False),
+                BasicDataset.preprocess(self.mask_values, img[1], self.scale, is_mask=False),
+            ], axis=0)
+        else:
+            img = BasicDataset.preprocess(self.mask_values, img, self.scale, is_mask=False)
         mask = BasicDataset.preprocess(self.mask_values, mask, self.scale, is_mask=True)
 
         return {
@@ -321,12 +369,16 @@ class AugmentedDataset(Dataset):
         h, w = img.shape[-2:]
         M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
 
-        img_rot = cv2.warpAffine(img[0], M, (w, h),
-                                  flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT)
+        # Same rotation matrix applied to every channel -- channels are spatially
+        # co-registered (e.g. water+fat) and must warp identically.
+        img_rot = np.stack([
+            cv2.warpAffine(img[c], M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT)
+            for c in range(img.shape[0])
+        ], axis=0).astype(np.float32)
         mask_rot = cv2.warpAffine(mask.astype(np.float32), M, (w, h),
                                    flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
 
-        return img_rot[np.newaxis, ...].astype(np.float32), mask_rot
+        return img_rot, mask_rot
 
     def _elastic_deform(self, img, mask):
         h, w = img.shape[-2:]
@@ -336,10 +388,14 @@ class AugmentedDataset(Dataset):
         x, y = np.meshgrid(np.arange(w), np.arange(h))
         coords = np.array([(y + dy).ravel(), (x + dx).ravel()])   # (row, col) order for map_coordinates
 
-        img_def = map_coordinates(img[0], coords, order=3, mode='reflect').reshape(h, w)
+        # Same displacement field applied to every channel, for the same reason as _rotate.
+        img_def = np.stack([
+            map_coordinates(img[c], coords, order=3, mode='reflect').reshape(h, w)
+            for c in range(img.shape[0])
+        ], axis=0).astype(np.float32)
         mask_def = map_coordinates(mask.astype(np.float32), coords, order=0, mode='reflect').reshape(h, w)
 
-        return img_def[np.newaxis, ...].astype(np.float32), mask_def
+        return img_def, mask_def
 
     def _adjust_contrast(self, img):
         factor = random.uniform(*self.contrast_range)

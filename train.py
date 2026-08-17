@@ -35,17 +35,25 @@ dir_mask = Path('./data/masks/')
 dir_checkpoint = Path('./checkpoints/')
 
 # Cardiac chamber labels in the NIfTI masks. 0 = background. VolumeMRIDataset
-# loads one of two phases from the same .dcm/.nii pair: 'water' keeps the 4
-# chambers (label 5/EAT relabelled to background), 'fat' keeps only EAT (labels
-# 1-4 relabelled to background instead) -- see its `phase` argument.
+# loads one (or both) of two phases from the same .dcm/.nii pair: 'water' keeps
+# the 4 chambers (label 5/EAT relabelled to background), 'fat' keeps only EAT
+# (labels 1-4 relabelled to background instead), 'both' stacks water+fat as a
+# 2-channel input and keeps every label -- see its `phase` argument.
 CLASS_NAMES = {1: 'LV', 2: 'RV', 3: 'LA', 4: 'RA'}
+BOTH_CLASS_NAMES = {1: 'LV', 2: 'RV', 3: 'LA', 4: 'RA', 5: 'EAT'}   # 'EAT' matches
+# PHASE_CLASS_NAMES['fat']'s class_name string, so metrics.compare_runs -- which
+# pairs rows on (patient_id, class_name) -- can actually match this class
+# against the existing dedicated fat-phase model's per-patient CSV.
 PHASE_CLASS_NAMES = {
     'water': CLASS_NAMES,
     'fat': {1: 'EAT'},
+    'both': BOTH_CLASS_NAMES,
 }
 # Model output channels (incl. background) appropriate for each phase, used as
 # the --classes default when the user doesn't override it.
-PHASE_N_CLASSES = {'water': 5, 'fat': 2}
+PHASE_N_CLASSES = {'water': 5, 'fat': 2, 'both': 6}
+# Model input channels appropriate for each phase.
+PHASE_N_CHANNELS = {'water': 1, 'fat': 1, 'both': 2}
 
 
 class PatientGroupedSampler(Sampler):
@@ -644,12 +652,14 @@ def get_args():
                         help='Percent of the patients held out as test (0-100)')
     parser.add_argument('--amp', action='store_true', default=False, help='Use mixed precision')
     parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
-    parser.add_argument('--phase', type=str, default='water', choices=['water', 'fat'],
+    parser.add_argument('--phase', type=str, default='water', choices=['water', 'fat', 'both'],
                         help='Which half of the DICOM volume / which mask labels to train on: '
-                             '"water" keeps the 4 chambers (default), "fat" keeps only EAT')
+                             '"water" keeps the 4 chambers (default), "fat" keeps only EAT, '
+                             '"both" stacks water+fat as a 2-channel input and predicts all 6 classes '
+                             '(4 chambers + EAT)')
     parser.add_argument('--classes', '-c', type=int, default=None,
                         help='Number of classes (output channels, incl. background). '
-                             'Defaults to 5 for --phase water, 2 for --phase fat')
+                             'Defaults to 5 for --phase water, 2 for --phase fat, 6 for --phase both')
     parser.add_argument('--augment', action='store_true', default=False,
                         help='Apply data augmentation to the training split')
     parser.add_argument('--run-name', dest='run_name', type=str, default=None,
@@ -695,10 +705,9 @@ if __name__ == '__main__':
     if args.classes is None:
         args.classes = PHASE_N_CLASSES[args.phase]
 
-    # Change here to adapt to your data
-    # n_channels=3 for RGB images
+    # n_channels is 1 for water/fat (single MRI channel), 2 for both (water+fat stacked)
     # n_classes is the number of probabilities you want to get per pixel
-    model = UNet(n_channels=1, n_classes=args.classes, bilinear=args.bilinear)
+    model = UNet(n_channels=PHASE_N_CHANNELS[args.phase], n_classes=args.classes, bilinear=args.bilinear)
     model = model.to(memory_format=torch.channels_last)
 
     logging.info(f'Network:\n'

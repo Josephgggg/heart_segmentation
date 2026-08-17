@@ -463,7 +463,7 @@ def _plot_overlay(img, gt, pred, n_classes, class_names, title, path):
     from matplotlib.colors import ListedColormap
     from matplotlib.patches import Patch
 
-    colors = ['none', 'tab:red', 'tab:green', 'tab:blue', 'tab:orange']
+    colors = ['none', 'tab:red', 'tab:green', 'tab:blue', 'tab:orange', 'tab:purple']
     cmap = ListedColormap(colors[:n_classes])
     class_names = class_names or {}
 
