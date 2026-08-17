@@ -142,12 +142,21 @@ def assd(pred: np.ndarray, gt: np.ndarray, spacing) -> float:
 
 @torch.inference_mode()
 @torch.inference_mode()
-def predict_volume(net, dataset, patient_indices, device, amp=False, batch_size=8, num_workers=2):
-    """Run the model over one patient's slices, in slice order, and stack to 3D."""
+def predict_volume(net, dataset, patient_indices, device, amp=False, batch_size=8,
+                   num_workers=2, return_entropy=False):
+    """Run the model over one patient's slices, in slice order, and stack to 3D.
+
+    return_entropy=True also returns the per-pixel Shannon entropy of the softmax
+    distribution (nats; 0 = fully confident, up to log(n_classes) = uniform over
+    every class) -- one extra softmax + reduction on logits already computed for
+    the argmax, not an extra forward pass. Computed in fp32 regardless of `amp`,
+    same reasoning as the loss: log() of small probabilities is the numerically
+    fragile part, and autocast's fp16 doesn't reliably keep that accurate.
+    """
     ordered = sorted(patient_indices, key=lambda i: dataset.index[i][1])
     loader = DataLoader(Subset(dataset, ordered), batch_size=batch_size, shuffle=False,
                         num_workers=num_workers, pin_memory=True)
-    preds, gts = [], []
+    preds, gts, entropies = [], [], []
     was_training = net.training
     net.eval()
     for batch in loader:
@@ -156,8 +165,14 @@ def predict_volume(net, dataset, patient_indices, device, amp=False, batch_size=
             logits = net(images)
         preds.append(logits.argmax(dim=1).cpu().numpy().astype(np.uint8))
         gts.append(batch['mask'].numpy().astype(np.uint8))
+        if return_entropy:
+            probs = torch.softmax(logits.float(), dim=1)
+            entropy = -(probs * torch.log(probs.clamp_min(1e-12))).sum(dim=1)
+            entropies.append(entropy.cpu().numpy().astype(np.float32))
     if was_training:
         net.train()
+    if return_entropy:
+        return np.concatenate(preds), np.concatenate(gts), np.concatenate(entropies)
     return np.concatenate(preds), np.concatenate(gts)
 
 

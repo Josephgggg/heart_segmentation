@@ -178,6 +178,66 @@ def split_patients(dataset, val_percent: float = 0.15, test_percent: float = 0.1
     return train_idx, val_idx, test_idx
 
 
+def _chunk_evenly(items, k):
+    """Split `items` into k contiguous chunks, sizes differing by at most 1."""
+    n = len(items)
+    base, rem = divmod(n, k)
+    chunks, start = [], 0
+    for i in range(k):
+        size = base + (1 if i < rem else 0)
+        chunks.append(items[start:start + size])
+        start += size
+    return chunks
+
+
+def split_patients_kfold(dataset, fold: int, k_folds: int = 5, test_percent: float = 0.15, seed: int = 0):
+    """K-fold patient-level split of the non-test pool. `fold` (0-indexed) is validation.
+
+    The test carve-out is the IDENTICAL computation split_patients uses -- same patient
+    list, same seed, same shuffle, same n_test -- so the held-out test set does not
+    change between a single-split run and a k-fold run at the same seed, and a test set
+    already frozen by an existing single-split run stays valid. Only the remaining pool
+    is treated differently: instead of one fixed val/train boundary, it is partitioned
+    into k_folds near-equal chunks (in shuffled order) and fold `fold` is validation,
+    the rest are train.
+
+    Returns (train_idx, val_idx, test_idx) into dataset.index, same shape as split_patients.
+    """
+    assert k_folds >= 2, f'k_folds must be >= 2, got {k_folds}'
+    assert 0 <= fold < k_folds, f'fold must be in [0, {k_folds}), got {fold}'
+
+    patients = sorted(dataset.mask_file_for)
+    random.Random(seed).shuffle(patients)
+
+    n = len(patients)
+    n_test = max(1, round(n * test_percent)) if test_percent > 0 else 0
+    test_patients = set(patients[:n_test])
+    pool = patients[n_test:]
+    assert k_folds <= len(pool), \
+        f'{k_folds} folds requested but only {len(pool)} patients remain after the {n_test}-patient test carve-out'
+
+    folds = _chunk_evenly(pool, k_folds)
+    val_patients = set(folds[fold])
+    train_patients = set(pool) - val_patients
+
+    by_patient = defaultdict(list)
+    for i, (patient_id, _) in enumerate(dataset.index):
+        by_patient[patient_id].append(i)
+
+    test_idx = sorted(i for p in test_patients for i in by_patient[p])
+    val_idx = sorted(i for p in val_patients for i in by_patient[p])
+    train_idx = sorted(i for p in train_patients for i in by_patient[p])
+
+    logging.info(
+        f'Patient-level {k_folds}-fold split of {n} patients / {len(dataset.index)} slices '
+        f'(seed {seed}), fold {fold}/{k_folds - 1}:\n'
+        f'        train: {len(train_patients):>2} patients, {len(train_idx):>5} slices\n'
+        f'        val:   {len(val_patients):>2} patients, {len(val_idx):>5} slices  {sorted(val_patients)}\n'
+        f'        test:  {n_test:>2} patients, {len(test_idx):>5} slices  {sorted(test_patients)}'
+    )
+    return train_idx, val_idx, test_idx
+
+
 def train_model(
         model,
         device,
@@ -205,6 +265,8 @@ def train_model(
         select_on: str = 'macro_dice',
         lr_schedule: str = 'poly',
         phase: str = 'water',
+        k_folds: int = 0,
+        fold: int = 0,
 ):
     # 0. Reseed. NOTE: the caller built the model, so its weights were already
     # drawn -- call set_seed() before UNet(...) too for a bit-comparable run.
@@ -218,10 +280,18 @@ def train_model(
     if dataset is None:
         dataset = build_dataset(img_scale, phase=phase)
 
-    # 2. Split into train / validation / test partitions, by patient
-    train_idx, val_idx, test_idx = split_patients(
-        dataset, val_percent=val_percent, test_percent=test_percent, seed=split_seed
-    )
+    # 2. Split into train / validation / test partitions, by patient.
+    # k_folds > 0 replaces the single fixed val boundary with a k-fold split of the
+    # non-test pool (see split_patients_kfold); val_percent is ignored in that case,
+    # but the test carve-out is identical either way at the same split_seed.
+    if k_folds > 0:
+        train_idx, val_idx, test_idx = split_patients_kfold(
+            dataset, fold=fold, k_folds=k_folds, test_percent=test_percent, seed=split_seed
+        )
+    else:
+        train_idx, val_idx, test_idx = split_patients(
+            dataset, val_percent=val_percent, test_percent=test_percent, seed=split_seed
+        )
 
     train_set = Subset(dataset, train_idx)
     val_set = Subset(dataset, val_idx)
@@ -275,6 +345,7 @@ def train_model(
         'n_classes': model.n_classes, 'n_channels': model.n_channels,
         'bilinear': model.bilinear,
         'val_percent': val_percent, 'test_percent': test_percent, 'split_seed': split_seed,
+        'k_folds': k_folds, 'fold': fold,
         'seed': seed, 'deterministic': deterministic,
         'n_train': n_train, 'n_val': n_val, 'n_test': n_test,
         'train_patients': sorted({dataset.index[i][0] for i in train_idx}),
@@ -297,6 +368,7 @@ def train_model(
     experiment.config.update(
         dict(epochs=epochs, batch_size=batch_size, learning_rate=learning_rate,
              val_percent=val_percent, test_percent=test_percent, split_seed=split_seed,
+             k_folds=k_folds, fold=fold,
              save_checkpoint=save_checkpoint, img_scale=img_scale, amp=amp, augment=augment,
              loss=loss_label, select_on=select_on, lr_schedule=lr_schedule, phase=phase,
              n_train=n_train, n_val=n_val, n_test=n_test)
@@ -307,7 +379,7 @@ def train_model(
         Batch size:      {batch_size}
         Learning rate:   {learning_rate}
         Training size:   {n_train}
-        Validation size: {n_val}
+        Validation size: {n_val}{f' (fold {fold}/{k_folds - 1})' if k_folds > 0 else ''}
         Test size:       {n_test} (held out, {'scored once after training' if eval_test else 'not scored'})
         Augmentation:    {augment}
         Loss:            {loss_label}
@@ -687,6 +759,16 @@ def get_args():
                         choices=['macro_dice', 'slice_dice'],
                         help='Metric used to pick best.pth. Keep this identical across '
                              'every arm of an ablation')
+    parser.add_argument('--k-folds', dest='k_folds', type=int, default=0,
+                        help='If > 0, replace the single fixed validation split with a K-fold '
+                             'split of the non-test pool; --fold selects which fold is '
+                             'validation (0-indexed). --validation is ignored when this is set. '
+                             'The test carve-out is identical to the single-split case at the '
+                             'same --split-seed, so an already-frozen test set stays valid. '
+                             'Run once per fold (e.g. one process per GPU with --run-name '
+                             'and --fold varying) -- this does not loop over folds itself')
+    parser.add_argument('--fold', type=int, default=0,
+                        help='Which fold (0-indexed) is validation, when --k-folds > 0')
 
     return parser.parse_args()
 
@@ -731,6 +813,8 @@ if __name__ == '__main__':
         val_percent=args.val / 100,
         test_percent=args.test / 100,
         split_seed=args.split_seed,
+        k_folds=args.k_folds,
+        fold=args.fold,
         eval_test=args.eval_test,
         amp=args.amp,
         augment=args.augment,
