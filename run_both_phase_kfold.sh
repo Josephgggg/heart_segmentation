@@ -42,6 +42,16 @@ PHASE=both
 EPOCHS=40
 BATCH_SIZE=8
 SPLIT_SEED=0   # FROZEN -- must match both_phase_augmentation_kfold.ipynb's SPLIT_SEED
+# Plain `python`/`python3` on this node resolves to the system FSL install,
+# which has no torch -- the notebooks avoid this because their Jupyter kernel
+# is already pinned to this venv, but a plain `bash script.sh` invocation gets
+# neither that kernel nor an interactive shell's PATH (bash scripts don't
+# source .bashrc), so it has to be pointed at the venv explicitly.
+PYTHON=/hpc/jgeo610/Virtual_ENV/unet_env/bin/python
+if ! "$PYTHON" -c "import torch" 2>/dev/null; then
+    echo "FATAL: $PYTHON can't import torch -- check the venv still exists at that path." >&2
+    exit 1
+fi
 # --seed is set to the fold index below (not a fixed constant): baseline and
 # data_aug at the SAME fold still share a seed, so augment is the only thing
 # that differs between them (the actual comparison) -- but different folds now
@@ -95,7 +105,7 @@ for fold in $(seq 0 $((K_FOLDS - 1))); do
         [ "$arm" = "data_aug" ] && aug_flag=(--augment)
 
         echo "start ${run_name} on GPU ${gpu} (log: logs_${PHASE}_${run_name}.log)"
-        CUDA_VISIBLE_DEVICES="$gpu" python train.py \
+        CUDA_VISIBLE_DEVICES="$gpu" "$PYTHON" train.py \
             --phase "$PHASE" --loss "$LOSS" --epochs "$EPOCHS" --batch-size "$BATCH_SIZE" \
             --amp --k-folds "$K_FOLDS" --fold "$fold" \
             --split-seed "$SPLIT_SEED" --seed "$fold" \
