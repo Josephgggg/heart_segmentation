@@ -1,0 +1,18 @@
+Using 1 GPU(s): 0
+start abl_dice_ce_kfold0 on GPU 0 (log: logs_both_abl_dice_ce_kfold0.log)
+start abl_dice_ce_kfold1 on GPU 0 (log: logs_both_abl_dice_ce_kfold1.log)
+start abl_dice_ce_kfold2 on GPU 0 (log: logs_both_abl_dice_ce_kfold2.log)
+start abl_dice_ce_kfold3 on GPU 0 (log: logs_both_abl_dice_ce_kfold3.log)
+start abl_dice_ce_kfold4 on GPU 0 (log: logs_both_abl_dice_ce_kfold4.log)
+start abl_tversky_ce_kfold0 on GPU 0 (log: logs_both_abl_tversky_ce_kfold0.log)
+start abl_tversky_ce_kfold1 on GPU 0 (log: logs_both_abl_tversky_ce_kfold1.log)
+start abl_tversky_ce_kfold2 on GPU 0 (log: logs_both_abl_tversky_ce_kfold2.log)
+start abl_tversky_ce_kfold3 on GPU 0 (log: logs_both_abl_tversky_ce_kfold3.log)
+start abl_tversky_ce_kfold4 on GPU 0 (log: logs_both_abl_tversky_ce_kfold4.log)
+start abl_dice_ce_boundary_kfold0 on GPU 0 (log: logs_both_abl_dice_ce_boundary_kfold0.log)
+start abl_dice_ce_boundary_kfold1 on GPU 0 (log: logs_both_abl_dice_ce_boundary_kfold1.log)
+start abl_dice_ce_boundary_kfold2 on GPU 0 (log: logs_both_abl_dice_ce_boundary_kfold2.log)
+start abl_dice_ce_boundary_kfold3 on GPU 0 (log: logs_both_abl_dice_ce_boundary_kfold3.log)
+start abl_dice_ce_boundary_kfold4 on GPU 0 (log: logs_both_abl_dice_ce_boundary_kfold4.log)
+Launched 15 job(s); waiting...
+All done. Check logs_both_*.log for any that failed.

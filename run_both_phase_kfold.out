@@ -1,0 +1,13 @@
+Using 1 GPU(s): 0
+start baseline_dice_ce_kfold0 on GPU 0 (log: logs_both_baseline_dice_ce_kfold0.log)
+start data_aug_dice_ce_kfold0 on GPU 0 (log: logs_both_data_aug_dice_ce_kfold0.log)
+start baseline_dice_ce_kfold1 on GPU 0 (log: logs_both_baseline_dice_ce_kfold1.log)
+start data_aug_dice_ce_kfold1 on GPU 0 (log: logs_both_data_aug_dice_ce_kfold1.log)
+start baseline_dice_ce_kfold2 on GPU 0 (log: logs_both_baseline_dice_ce_kfold2.log)
+start data_aug_dice_ce_kfold2 on GPU 0 (log: logs_both_data_aug_dice_ce_kfold2.log)
+start baseline_dice_ce_kfold3 on GPU 0 (log: logs_both_baseline_dice_ce_kfold3.log)
+start data_aug_dice_ce_kfold3 on GPU 0 (log: logs_both_data_aug_dice_ce_kfold3.log)
+start baseline_dice_ce_kfold4 on GPU 0 (log: logs_both_baseline_dice_ce_kfold4.log)
+start data_aug_dice_ce_kfold4 on GPU 0 (log: logs_both_data_aug_dice_ce_kfold4.log)
+Launched 10 job(s); waiting...
+All done. Check logs_both_*.log for any that failed.
