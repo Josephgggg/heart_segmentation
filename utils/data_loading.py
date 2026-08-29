@@ -159,13 +159,20 @@ class VolumeMRIDataset(Dataset):
     }
 
     def __init__(self, images_dir, mask_dir, scale: float = 1.0, cache_size: int = 4700, disk_cache_dir=None,
-                 phase: str = 'water'):
+                 phase: str = 'water', context_slices: int = 0):
         if phase not in self.PHASE_MASK_VALUES:
             raise ValueError(f"phase must be one of {sorted(self.PHASE_MASK_VALUES)}, got {phase!r}")
+        if context_slices < 0:
+            raise ValueError(f'context_slices must be >= 0, got {context_slices}')
         self.images_dir = Path(images_dir)
         self.mask_dir = Path(mask_dir)
         self.scale = scale
         self.cache_size = cache_size
+        # 2.5D support: __getitem__ stacks `2 * context_slices + 1` neighboring
+        # z-slices as input channels instead of just the center slice (0 = plain
+        # 2D, the original behaviour). The mask target stays the single center
+        # slice -- this is still a 2D segmentation, just with neighbor context.
+        self.context_slices = context_slices
         # Each patient's .dcm holds both phases back to back: the first half of
         # slices is the water acquisition, the second half is fat, both sharing
         # the same NIfTI mask geometry. 'phase' picks which half of the volume
@@ -315,22 +322,45 @@ class VolumeMRIDataset(Dataset):
             self._volume_cache.popitem(last=False)
         return img_vol, mask_vol
 
+    def _neighbor_indices(self, n_slices, slice_idx):
+        """2.5D context window around slice_idx: [slice_idx-k, ..., slice_idx+k].
+
+        Edge-replicated at the volume boundaries (clamped, not zero-padded) so a
+        slice near the top/bottom of the volume still gets `2k+1` real, if
+        repeated, slices rather than a blank one.
+        """
+        k = self.context_slices
+        return [min(max(slice_idx + o, 0), n_slices - 1) for o in range(-k, k + 1)]
+
+    def _preprocess_stack(self, slices):
+        """slices: (W, H, w) independent 2D slices -> normalized, stacked as (W, H, w).
+
+        Each slice is normalized on its own (same reasoning as the water/fat
+        split below): a 0.5/99.5 percentile clip computed jointly across slices
+        would let one slice's brightness distribution skew another's.
+        """
+        return np.concatenate(
+            [BasicDataset.preprocess(self.mask_values, slices[i], self.scale, is_mask=False)
+             for i in range(slices.shape[0])],
+            axis=0
+        )
+
     def __getitem__(self, idx):
         patient_id, slice_idx = self.index[idx]
         img_vol, mask_vol = self._get_volume(patient_id)   # uses the cache now
-        img, mask = img_vol[slice_idx], mask_vol[slice_idx]
+        neighbor_idxs = self._neighbor_indices(img_vol.shape[0], slice_idx)
+        img_window, mask = img_vol[neighbor_idxs], mask_vol[slice_idx]
 
         if self.phase == 'both':
-            # img is (2, H, W): water, fat. Normalize each channel independently --
-            # preprocess() computes its 0.5/99.5 percentile clip over whatever 2D
-            # array it's given, so combining channels before clipping would let one
-            # channel's brightness distribution skew the other's normalization.
+            # img_window is (window, 2, H, W): water, fat. Grouped by phase in the
+            # output (all water slices, then all fat slices) so the ordering stays
+            # predictable regardless of window size.
             img = np.concatenate([
-                BasicDataset.preprocess(self.mask_values, img[0], self.scale, is_mask=False),
-                BasicDataset.preprocess(self.mask_values, img[1], self.scale, is_mask=False),
+                self._preprocess_stack(img_window[:, 0]),
+                self._preprocess_stack(img_window[:, 1]),
             ], axis=0)
         else:
-            img = BasicDataset.preprocess(self.mask_values, img, self.scale, is_mask=False)
+            img = self._preprocess_stack(img_window)
         mask = BasicDataset.preprocess(self.mask_values, mask, self.scale, is_mask=True)
 
         return {
@@ -349,7 +379,7 @@ class AugmentedDataset(Dataset):
     def __init__(self, base_dataset, rotate_prob=0.5, rotate_range=20,
                  elastic_prob=0.3, elastic_alpha=20, elastic_sigma=4,
                  contrast_prob=0.3, contrast_range=(0.4, 1.6),
-                 noise_prob=0.3, noise_std=0.1):
+                 noise_prob=0.3, noise_std=0.1, channel_group_size=None):
         self.base_dataset = base_dataset
         self.rotate_prob = rotate_prob
         self.rotate_range = rotate_range      # max degrees, either direction
@@ -360,6 +390,20 @@ class AugmentedDataset(Dataset):
         self.contrast_range = contrast_range      # (min_factor, max_factor)
         self.noise_prob = noise_prob
         self.noise_std = noise_std                # std dev of gaussian noise, in normalized [0,1] intensity units
+        # Contrast is jittered per channel-GROUP rather than globally, so that with
+        # phase='both' a single factor/mean isn't shared across water and fat, which
+        # have different intensity distributions (see _adjust_contrast). None means
+        # "one group, whole image" -- correct for single-phase and for BasicDataset.
+        self.channel_group_size = channel_group_size or self._infer_group_size(base_dataset)
+
+    @staticmethod
+    def _infer_group_size(base_dataset):
+        ds = base_dataset
+        while isinstance(ds, tud.Subset):
+            ds = ds.dataset
+        if getattr(ds, 'phase', None) != 'both':
+            return None
+        return 2 * getattr(ds, 'context_slices', 0) + 1
 
     def __len__(self):
         return len(self.base_dataset)
@@ -397,12 +441,21 @@ class AugmentedDataset(Dataset):
 
         return img_def, mask_def
 
-    def _adjust_contrast(self, img):
+    def _adjust_contrast_group(self, img):
         factor = random.uniform(*self.contrast_range)
         mean = img.mean()
         img = (img - mean) * factor + mean
         img = np.clip(img, 0.0, 1.0)
         return img.astype(np.float32)
+
+    def _adjust_contrast(self, img):
+        if self.channel_group_size is None:
+            return self._adjust_contrast_group(img)
+        # Jitter water and fat sub-stacks independently -- see channel_group_size
+        # in __init__. Each group keeps its own mean/factor rather than sharing
+        # one drawn from the combined water+fat distribution.
+        groups = [img[:self.channel_group_size], img[self.channel_group_size:]]
+        return np.concatenate([self._adjust_contrast_group(g) for g in groups], axis=0)
 
     def _add_intensity_noise(self, img):
         noise = np.random.normal(loc=0.0, scale=self.noise_std, size=img.shape).astype(np.float32)

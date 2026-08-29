@@ -541,7 +541,10 @@ def save_best_worst_slices(net, dataset, indices, device, n_classes, out_dir,
     paths = {}
     for tag, entry in (('best', best), ('worst', worst)):
         score, patient_id, slice_idx, global_idx, pred_slice, gt_slice = entry
-        img = dataset[global_idx]['image'].numpy()[0]
+        # With a 2.5D context window the image channels are neighbor z-slices
+        # (or phase-grouped windows); show the center slice, not channel 0.
+        center_channel = getattr(dataset, 'context_slices', 0)
+        img = dataset[global_idx]['image'].numpy()[center_channel]
         path = out_dir / f'{split_name}_{tag}_slice.png'
         _plot_overlay(img, gt_slice, pred_slice, n_classes, class_names,
                       title=f'{tag} {split_name} slice — {patient_id} #{slice_idx} (Dice={score:.3f})',

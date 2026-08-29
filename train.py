@@ -52,8 +52,14 @@ PHASE_CLASS_NAMES = {
 # Model output channels (incl. background) appropriate for each phase, used as
 # the --classes default when the user doesn't override it.
 PHASE_N_CLASSES = {'water': 5, 'fat': 2, 'both': 6}
-# Model input channels appropriate for each phase.
+# Model input channels appropriate for each phase, before any 2.5D context window
+# is applied. With context_slices=k, actual model input channels are this value
+# times (2k+1) -- see n_channels_for().
 PHASE_N_CHANNELS = {'water': 1, 'fat': 1, 'both': 2}
+
+
+def n_channels_for(phase: str, context_slices: int = 0) -> int:
+    return PHASE_N_CHANNELS[phase] * (2 * context_slices + 1)
 
 
 class PatientGroupedSampler(Sampler):
@@ -126,9 +132,9 @@ def seed_worker(worker_id):
     random.seed(worker_seed)
 
 
-def build_dataset(img_scale: float = 0.5, phase: str = 'water'):
+def build_dataset(img_scale: float = 0.5, phase: str = 'water', context_slices: int = 0):
     try:
-        return VolumeMRIDataset(dir_img, dir_mask, img_scale, phase=phase)
+        return VolumeMRIDataset(dir_img, dir_mask, img_scale, phase=phase, context_slices=context_slices)
     except (AssertionError, RuntimeError, IndexError):
         return BasicDataset(dir_img, dir_mask, img_scale)
 
@@ -265,6 +271,7 @@ def train_model(
         select_on: str = 'macro_dice',
         lr_schedule: str = 'poly',
         phase: str = 'water',
+        context_slices: int = 0,
         k_folds: int = 0,
         fold: int = 0,
 ):
@@ -278,7 +285,7 @@ def train_model(
 
     # 1. Create dataset
     if dataset is None:
-        dataset = build_dataset(img_scale, phase=phase)
+        dataset = build_dataset(img_scale, phase=phase, context_slices=context_slices)
 
     # 2. Split into train / validation / test partitions, by patient.
     # k_folds > 0 replaces the single fixed val boundary with a k-fold split of the
@@ -341,7 +348,7 @@ def train_model(
                       'plateau': 'ReduceLROnPlateau(max, patience=5), per epoch',
                       'constant': 'none'}[lr_schedule],
         'img_scale': img_scale, 'amp': amp, 'augment': augment,
-        'loss': loss_label, 'select_on': select_on, 'phase': phase,
+        'loss': loss_label, 'select_on': select_on, 'phase': phase, 'context_slices': context_slices,
         'n_classes': model.n_classes, 'n_channels': model.n_channels,
         'bilinear': model.bilinear,
         'val_percent': val_percent, 'test_percent': test_percent, 'split_seed': split_seed,
@@ -769,6 +776,12 @@ def get_args():
                              'and --fold varying) -- this does not loop over folds itself')
     parser.add_argument('--fold', type=int, default=0,
                         help='Which fold (0-indexed) is validation, when --k-folds > 0')
+    parser.add_argument('--context-slices', dest='context_slices', type=int, default=0,
+                        help='2.5D context: stack this many neighboring z-slices on each side '
+                             'of the center slice as extra input channels (0 = plain 2D, the '
+                             'default). Model input channels become PHASE_N_CHANNELS[phase] * '
+                             '(2*context_slices + 1); the segmentation target is still just the '
+                             'center slice\'s mask.')
 
     return parser.parse_args()
 
@@ -787,9 +800,11 @@ if __name__ == '__main__':
     if args.classes is None:
         args.classes = PHASE_N_CLASSES[args.phase]
 
-    # n_channels is 1 for water/fat (single MRI channel), 2 for both (water+fat stacked)
+    # n_channels is 1 for water/fat (single MRI channel), 2 for both (water+fat stacked),
+    # times (2*context_slices + 1) for the 2.5D neighbor window (context_slices=0 by default)
     # n_classes is the number of probabilities you want to get per pixel
-    model = UNet(n_channels=PHASE_N_CHANNELS[args.phase], n_classes=args.classes, bilinear=args.bilinear)
+    model = UNet(n_channels=n_channels_for(args.phase, args.context_slices),
+                 n_classes=args.classes, bilinear=args.bilinear)
     model = model.to(memory_format=torch.channels_last)
 
     logging.info(f'Network:\n'
@@ -825,6 +840,7 @@ if __name__ == '__main__':
         select_on=args.select_on,
         lr_schedule=args.lr_schedule,
         phase=args.phase,
+        context_slices=args.context_slices,
     )
     try:
         train_model(model=model, **train_kwargs)

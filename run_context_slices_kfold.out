@@ -1,0 +1,8 @@
+Using 1 GPU(s): 1
+start ctx_2p5d_kfold0 on GPU 1 (log: logs_both_ctx_2p5d_kfold0.log)
+start ctx_2p5d_kfold1 on GPU 1 (log: logs_both_ctx_2p5d_kfold1.log)
+start ctx_2p5d_kfold2 on GPU 1 (log: logs_both_ctx_2p5d_kfold2.log)
+start ctx_2p5d_kfold3 on GPU 1 (log: logs_both_ctx_2p5d_kfold3.log)
+start ctx_2p5d_kfold4 on GPU 1 (log: logs_both_ctx_2p5d_kfold4.log)
+Launched 5 job(s); waiting...
+All done. Check logs_both_ctx_2p5d_kfold*.log for any that failed.
