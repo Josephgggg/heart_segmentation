@@ -3,3 +3,8 @@ numpy==1.23.5
 Pillow==9.3.0
 tqdm==4.64.1
 wandb==0.13.5
+# only needed for --arch attention_unet (unet/attention_unet.py).
+# Install it with --no-deps: this venv's torch is a +cu118 build that pip does
+# not see as an installed distribution, so a plain install pulls a fresh CUDA-13
+# torch over the top of it and breaks the environment.
+monai==1.6.0

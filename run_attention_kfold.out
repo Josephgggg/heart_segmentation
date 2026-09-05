@@ -1,0 +1,8 @@
+Using 1 GPU(s): 0
+start attn_kfold0 on GPU 0 (log: logs_both_attn_kfold0.log)
+start attn_kfold1 on GPU 0 (log: logs_both_attn_kfold1.log)
+start attn_kfold2 on GPU 0 (log: logs_both_attn_kfold2.log)
+start attn_kfold3 on GPU 0 (log: logs_both_attn_kfold3.log)
+start attn_kfold4 on GPU 0 (log: logs_both_attn_kfold4.log)
+Launched 5 job(s); waiting...
+All done. Check logs_both_attn_kfold*.log for any that failed.

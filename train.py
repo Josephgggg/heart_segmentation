@@ -62,6 +62,38 @@ def n_channels_for(phase: str, context_slices: int = 0) -> int:
     return PHASE_N_CHANNELS[phase] * (2 * context_slices + 1)
 
 
+# Selectable architectures:
+#   'unet'             the upstream milesial UNet this project has used throughout;
+#   'unet_attn_gates'  that same UNet with MONAI's attention gate (Oktay et al.
+#                      2018) on each skip connection and NOTHING else changed --
+#                      the clean ablation, and the arm to use for "do attention
+#                      gates help";
+#   'attention_unet'   MONAI's whole AttentionUnet network, which also swaps the
+#                      blocks, the downsampling and the skip fusion, so it answers
+#                      "how does the reference implementation compare" instead.
+# See each module's docstring in unet/ before reading a comparison.
+ARCHITECTURES = ('unet', 'unet_attn_gates', 'attention_unet')
+
+
+def build_model(arch: str, n_channels: int, n_classes: int, bilinear: bool = False):
+    """Construct one of ARCHITECTURES.
+
+    Call set_seed() BEFORE this -- both architectures draw their initial weights
+    from the torch RNG, same as calling UNet(...) directly.
+    """
+    if arch == 'unet':
+        return UNet(n_channels=n_channels, n_classes=n_classes, bilinear=bilinear)
+    # Imported lazily: monai is only a dependency of these arms, so a plain
+    # `--arch unet` run still works in an environment without it.
+    if arch == 'unet_attn_gates':
+        from unet.attention_gate_unet import AttentionGateUNet
+        return AttentionGateUNet(n_channels=n_channels, n_classes=n_classes, bilinear=bilinear)
+    if arch == 'attention_unet':
+        from unet.attention_unet import AttentionUNet
+        return AttentionUNet(n_channels=n_channels, n_classes=n_classes, bilinear=bilinear)
+    raise ValueError(f'Unknown architecture {arch!r}, expected one of {ARCHITECTURES}')
+
+
 class PatientGroupedSampler(Sampler):
     def __init__(self, index_subset):
         self.index_subset = index_subset
@@ -351,6 +383,8 @@ def train_model(
         'loss': loss_label, 'select_on': select_on, 'phase': phase, 'context_slices': context_slices,
         'n_classes': model.n_classes, 'n_channels': model.n_channels,
         'bilinear': model.bilinear,
+        # plain UNet has no .arch attribute; it is the historical default
+        'arch': getattr(model, 'arch', 'unet'),
         'val_percent': val_percent, 'test_percent': test_percent, 'split_seed': split_seed,
         'k_folds': k_folds, 'fold': fold,
         'seed': seed, 'deterministic': deterministic,
@@ -731,6 +765,14 @@ def get_args():
                         help='Percent of the patients held out as test (0-100)')
     parser.add_argument('--amp', action='store_true', default=False, help='Use mixed precision')
     parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
+    parser.add_argument('--arch', type=str, default='unet', choices=list(ARCHITECTURES),
+                        help='Network architecture. "unet" is the milesial UNet used for '
+                             'every run so far. "unet_attn_gates" is that same UNet with MONAI\'s '
+                             'attention gate on each skip and nothing else changed -- the clean '
+                             'attention ablation. "attention_unet" is MONAI\'s whole AttentionUnet '
+                             'network, which also replaces the blocks, the downsampling and the '
+                             'skip fusion, so it is NOT an attention-only ablation of "unet". '
+                             'The latter two require monai; "attention_unet" rejects --bilinear')
     parser.add_argument('--phase', type=str, default='water', choices=['water', 'fat', 'both'],
                         help='Which half of the DICOM volume / which mask labels to train on: '
                              '"water" keeps the 4 chambers (default), "fat" keeps only EAT, '
@@ -803,11 +845,12 @@ if __name__ == '__main__':
     # n_channels is 1 for water/fat (single MRI channel), 2 for both (water+fat stacked),
     # times (2*context_slices + 1) for the 2.5D neighbor window (context_slices=0 by default)
     # n_classes is the number of probabilities you want to get per pixel
-    model = UNet(n_channels=n_channels_for(args.phase, args.context_slices),
-                 n_classes=args.classes, bilinear=args.bilinear)
+    model = build_model(args.arch,
+                        n_channels=n_channels_for(args.phase, args.context_slices),
+                        n_classes=args.classes, bilinear=args.bilinear)
     model = model.to(memory_format=torch.channels_last)
 
-    logging.info(f'Network:\n'
+    logging.info(f'Network: {args.arch}\n'
                  f'\t{model.n_channels} input channels\n'
                  f'\t{model.n_classes} output channels (classes)\n'
                  f'\t{"Bilinear" if model.bilinear else "Transposed conv"} upscaling')

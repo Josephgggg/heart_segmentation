@@ -176,8 +176,82 @@ def predict_volume(net, dataset, patient_indices, device, amp=False, batch_size=
     return np.concatenate(preds), np.concatenate(gts)
 
 
+def annotated_slices(gt_vol: np.ndarray, margin: int = 0) -> np.ndarray:
+    """Boolean per-slice mask of the slices that carry any annotation at all.
+
+    The masks in this dataset are truncated: labelling stops at a z where the
+    anatomy plainly continues. 48 of 50 volumes have unlabelled slices at the top
+    and 16.4% of slices per volume fall outside the annotated block on average.
+    Ground truth on those slices reads "background everywhere", so an anatomically
+    correct prediction there is scored as a false positive -- which means part of
+    what any metric measures is how well the model reproduces the annotator's
+    stopping point rather than the anatomy.
+
+    A slice counts as annotated if ANY foreground class is present. The union over
+    classes is the right test: a single class can legitimately be absent from a
+    slice inside the heart, but a slice where every structure is absent was never
+    drawn on.
+
+    `margin` additionally drops that many slices from each end of the annotated
+    block. The outermost labelled slice is often only partially drawn -- the
+    annotator tapering off rather than stopping cleanly -- so a margin tests
+    whether a conclusion depends on exactly where the boundary is placed.
+
+    Returns a boolean array of length gt_vol.shape[0]. Deliberately a per-slice
+    mask rather than a (lo, hi) range: 49 of 50 volumes are one contiguous block,
+    but CADRE_1866 has 7 blank interior slices that a range would silently
+    readmit as if they had been annotated.
+    """
+    annotated = (gt_vol > 0).reshape(gt_vol.shape[0], -1).any(axis=1)
+    if margin > 0 and annotated.any():
+        z = np.flatnonzero(annotated)
+        lo, hi = z[0] + margin, z[-1] - margin
+        eroded = np.zeros_like(annotated)
+        if lo <= hi:
+            eroded[lo:hi + 1] = annotated[lo:hi + 1]
+        annotated = eroded
+    return annotated
+
+
+def rows_for_volume(pred_vol, gt_vol, patient_id, n_classes, spacing=None,
+                    class_names=None, compute_hd95=True, extra=None):
+    """One row per foreground class for a single, already-predicted volume.
+
+    Split out of evaluate_per_patient so that a caller wanting to score the same
+    prediction under several slice-inclusion policies pays for inference once
+    instead of once per policy. `extra` merges additional columns into every row
+    (the sensitivity analysis uses it to record how many slices it actually
+    scored); the default training path passes nothing, so its CSV schema is
+    unchanged.
+    """
+    rows = []
+    for cls in range(1, n_classes):       # class 0 is background
+        pred_c, gt_c = pred_vol == cls, gt_vol == cls
+        surf = (surface_metrics(pred_c, gt_c, spacing) if compute_hd95
+                else {'hd95_mm': float('nan'), 'assd_mm': float('nan')})
+        pr = precision_recall(pred_c, gt_c)
+        rows.append({
+            'patient_id': patient_id,
+            'cls': cls,
+            'class_name': (class_names or {}).get(cls, f'class_{cls}'),
+            'dice': dice_binary(pred_c, gt_c),
+            'precision': pr['precision'],
+            'recall': pr['recall'],
+            'hd95_mm': surf['hd95_mm'],
+            'assd_mm': surf['assd_mm'],
+            'gt_voxels': int(gt_c.sum()),
+            'pred_voxels': int(pred_c.sum()),
+            # for volume agreement; needs spacing, so nan on the cheap path
+            'voxel_ml': float(np.prod(spacing)) / 1000.0 if spacing is not None else float('nan'),
+            'missed': bool(gt_c.any() and not pred_c.any()),
+            **(extra or {}),
+        })
+    return rows
+
+
 def evaluate_per_patient(net, dataset, indices, device, n_classes, amp=False,
-                         class_names=None, batch_size=8, compute_hd95=True, quiet=False):
+                         class_names=None, batch_size=8, compute_hd95=True, quiet=False,
+                         restrict_to_annotated=False, annotated_margin=0):
     """Score every patient covered by `indices`, one row per (patient, class).
 
     Returns a list of dicts: patient_id, cls, class_name, dice, hd95_mm,
@@ -187,6 +261,11 @@ def evaluate_per_patient(net, dataset, indices, device, n_classes, amp=False,
     they need), leaving just Dice -- that is the cheap path used for per-epoch
     checkpoint selection. `quiet` suppresses the per-patient progress line, which
     is noise when this runs every epoch.
+
+    `restrict_to_annotated=True` scores only the slices that carry annotation (see
+    annotated_slices), optionally shrunk at both ends by `annotated_margin`. This
+    is the sensitivity-analysis path and is OFF by default: the primary endpoint
+    stays whole-volume so previously reported numbers remain exactly reproducible.
     """
     by_patient = defaultdict(list)
     for i in indices:
@@ -196,30 +275,14 @@ def evaluate_per_patient(net, dataset, indices, device, n_classes, amp=False,
     for n, (patient_id, idxs) in enumerate(sorted(by_patient.items()), start=1):
         pred_vol, gt_vol = predict_volume(net, dataset, idxs, device, amp=amp, batch_size=batch_size)
         spacing = dataset.spacing_for(patient_id) if compute_hd95 else None
+        if restrict_to_annotated:
+            keep = annotated_slices(gt_vol, margin=annotated_margin)
+            pred_vol, gt_vol = pred_vol[keep], gt_vol[keep]
         if not quiet:
             logging.info(f'  [{n}/{len(by_patient)}] {patient_id}: {pred_vol.shape[0]} slices, '
                          f'spacing {tuple(round(s, 4) for s in spacing)} mm')
-
-        for cls in range(1, n_classes):       # class 0 is background
-            pred_c, gt_c = pred_vol == cls, gt_vol == cls
-            surf = (surface_metrics(pred_c, gt_c, spacing) if compute_hd95
-                    else {'hd95_mm': float('nan'), 'assd_mm': float('nan')})
-            pr = precision_recall(pred_c, gt_c)
-            rows.append({
-                'patient_id': patient_id,
-                'cls': cls,
-                'class_name': (class_names or {}).get(cls, f'class_{cls}'),
-                'dice': dice_binary(pred_c, gt_c),
-                'precision': pr['precision'],
-                'recall': pr['recall'],
-                'hd95_mm': surf['hd95_mm'],
-                'assd_mm': surf['assd_mm'],
-                'gt_voxels': int(gt_c.sum()),
-                'pred_voxels': int(pred_c.sum()),
-                # for volume agreement; needs spacing, so nan on the cheap path
-                'voxel_ml': float(np.prod(spacing)) / 1000.0 if spacing is not None else float('nan'),
-                'missed': bool(gt_c.any() and not pred_c.any()),
-            })
+        rows += rows_for_volume(pred_vol, gt_vol, patient_id, n_classes, spacing=spacing,
+                                class_names=class_names, compute_hd95=compute_hd95)
     return rows
 
 
@@ -458,17 +521,26 @@ def write_csv(rows, path):
 
 
 def report(net, dataset, indices, device, n_classes, out_dir=None, split_name='test',
-           amp=False, class_names=None, batch_size=8, compute_hd95=True):
-    """Score a split per patient, write both CSVs, and return (rows, summary)."""
+           amp=False, class_names=None, batch_size=8, compute_hd95=True,
+           restrict_to_annotated=False, annotated_margin=0, file_suffix=''):
+    """Score a split per patient, write both CSVs, and return (rows, summary).
+
+    `restrict_to_annotated` / `annotated_margin` are forwarded to
+    evaluate_per_patient; `file_suffix` is appended to both CSV names so a
+    sensitivity re-scoring lands beside the primary CSVs instead of over them.
+    All three default to the original behaviour.
+    """
     logging.info(f'Scoring {split_name} split per patient (Dice + {"HD95" if compute_hd95 else "no HD95"})...')
     rows = evaluate_per_patient(net, dataset, indices, device, n_classes, amp=amp,
                                 class_names=class_names, batch_size=batch_size,
-                                compute_hd95=compute_hd95)
+                                compute_hd95=compute_hd95,
+                                restrict_to_annotated=restrict_to_annotated,
+                                annotated_margin=annotated_margin)
     summary = summarise(rows)
     logging.info(f'\n{split_name} results (mean +/- SD across patients):\n{format_summary(summary)}')
     if out_dir is not None:
-        write_csv(rows, out_dir / f'{split_name}_metrics_per_patient.csv')
-        write_csv(summary, out_dir / f'{split_name}_metrics_summary.csv')
+        write_csv(rows, out_dir / f'{split_name}_metrics_per_patient{file_suffix}.csv')
+        write_csv(summary, out_dir / f'{split_name}_metrics_summary{file_suffix}.csv')
     return rows, summary
 
 
