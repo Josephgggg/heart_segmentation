@@ -148,4 +148,4 @@ fi
 
 echo "Launched ${#pids[@]} job(s); waiting..."
 wait "${pids[@]}"
-echo "All done. Check logs_${PHASE}_attn_kfold*.log for any that failed."
+echo "All done. Check logs_${PHASE}_attngate_kfold*.log for any that failed."
