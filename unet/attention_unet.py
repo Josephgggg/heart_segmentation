@@ -23,10 +23,17 @@ difference as "this architecture vs that architecture", not as "attention helps"
 Input size: MONAI concatenates skip and upsampled features with no padding or
 cropping, so every spatial dimension has to survive `len(channels) - 1` halvings
 and be doubled back exactly -- i.e. be a multiple of 2 ** (len(channels) - 1),
-16 for the default 5 levels. At the project default `--scale 0.5` the slices are
-432x432 (432 = 16 * 27), so nothing happens; `forward` zero-pads the bottom/right
-up to that multiple and crops the logits back, so that a different `--scale` is
-not a shape crash from inside MONAI. `UNet` gets this for free via `Up`'s F.pad.
+16 for the default 5 levels. `forward` zero-pads the bottom/right up to that
+multiple and crops the logits back, so no `--scale` is a shape crash from inside
+MONAI. `UNet` gets this for free via `Up`'s F.pad.
+
+That pad path is NOT dormant at the project default, contrary to what this
+docstring used to claim. The volumes on disk are 432x432, but `--scale` is
+applied by `BasicDataset.preprocess` at load time, so at the default
+`--scale 0.5` the model sees 216x216 -- and 216 = 8 * 27 is not a multiple of
+16, so every batch is padded to 224 and cropped back. It is `--scale 1.0`
+(432 = 16 * 27) that needs no padding. Checked against the cached volumes in
+`preprocessed_cache/` and the `img_scale: 0.5` recorded in every run_config.json.
 """
 
 from __future__ import annotations

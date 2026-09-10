@@ -1,0 +1,20 @@
+splits_final.json OK: 5 folds partitioning 42 patients
+Auto-selected idle GPU(s): 8 0  (>= 16000 MiB free, <= 25% util)
+Dataset 501  config 3d_fullres  trainer nnUNetTrainer_250epochs
+Concurrency 2 fold(s), 4 DA workers each
+  => up to 10 processes; node currently at load: 90.52, 88.00, 82.51
+  GPU 0, 18247 MiB, 0 %
+  GPU 1, 11537 MiB, 100 %
+  GPU 2, 13193 MiB, 99 %
+  GPU 3, 14133 MiB, 0 %
+  GPU 4, 1239 MiB, 0 %
+  GPU 5, 18953 MiB, 99 %
+  GPU 6, 22311 MiB, 99 %
+  GPU 7, 17501 MiB, 100 %
+  GPU 8, 20721 MiB, 14 %
+  GPU 9, 16447 MiB, 100 %
+fold 0 -> GPU 0 
+fold 1: no GPU free (>= 16000 MiB, <= 25%), waiting 5 min...
+fold 1 -> GPU 8 
+fold 2 -> GPU 3 
+fold 3 -> GPU 6 

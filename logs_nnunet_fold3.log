@@ -1,0 +1,21 @@
+/tmp/matplotlib is not a writable directory
+Matplotlib created a temporary cache directory at /tmp/matplotlib-zkbp2p3z because there was an issue with the default path (/tmp/matplotlib); it is highly recommended to set the MPLCONFIGDIR environment variable to a writable directory, in particular to speed up the import of Matplotlib and to better support multiprocessing.
+
+############################
+INFO: You are using the old nnU-Net default plans. We have updated our recommendations. Please consider using those instead! Read more here: https://github.com/MIC-DKFZ/nnUNet/blob/master/documentation/resenc_presets.md
+############################
+
+Using device: cuda:0
+
+#######################################################################
+Please cite the following paper when using nnU-Net:
+Isensee, F., Jaeger, P. F., Kohl, S. A., Petersen, J., & Maier-Hein, K. H. (2021). nnU-Net: a self-configuring method for deep learning-based biomedical image segmentation. Nature methods, 18(2), 203-211.
+#######################################################################
+
+2026-09-10 20:46:48.250978: Using torch.compile...
+2026-09-10 20:46:49.940815: do_dummy_2d_data_aug: True
+2026-09-10 20:46:49.950205: Using splits from existing split file: /hpc/jgeo610/nnunet/preprocessed/Dataset501_CardiacBoth/splits_final.json
+2026-09-10 20:46:49.962166: The split file contains 5 splits.
+2026-09-10 20:46:49.974261: Desired fold for training: 3
+2026-09-10 20:46:49.980880: This split has 34 training and 8 validation cases.
+using pin_memory on device 0
